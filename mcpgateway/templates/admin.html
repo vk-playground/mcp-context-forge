@@ -1010,6 +1010,7 @@
                 >
 
                   <option value="REST">REST</option>
+                  <option value="MCP">MCP</option>
                 </select>
               </div>
               <div>
@@ -1418,24 +1419,38 @@
             <div class="grid grid-cols-1 gap-6">
               <div>
                 <label
+                  class="block text-sm font-medium text-gray-700 dark:text-gray-300"
+                  >Gateway Name</label
+                >
+                <input
+                  type="text"
+                  name="gateway_name"
+                  id="edit-tool-gateway-name"
+                  class="mt-1 block w-full rounded-md border border-gray-300 dark:border-gray-600 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
+                />
+              </div>
+              <div>
+                <label
+                  class="block text-sm font-medium text-gray-700 dark:text-gray-400"
+                  >Original Name</label
+                >
+                <input
+                  type="text"
+                  name="original_name"
+                  id="edit-tool-name"
+                  required
+                  class="mt-1 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
+                />
+              </div>
+
+              <div>
+                <label
                   class="block text-sm font-medium text-gray-700 dark:text-gray-400"
                   >URI</label
                 >
                 <input
                   type="text"
                   name="uri"
-                  required
-                  class="mt-1 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
-                />
-              </div>
-              <div>
-                <label
-                  class="block text-sm font-medium text-gray-700 dark:text-gray-400"
-                  >Name</label
-                >
-                <input
-                  type="text"
-                  name="name"
                   required
                   class="mt-1 block w-full rounded-md border border-gray-300 dark:border-gray-700 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
                 />
@@ -2633,7 +2648,7 @@
                 Edit Tool
               </h3>
               <div class="mt-4">
-                <form id="edit-tool-form" method="POST">
+                <form id="edit-tool-form" method="POST" onsubmit="document.getElementById('edit-tool-name-hidden').value = document.getElementById('edit-tool-name').value">
                   <div class="grid grid-cols-1 gap-6">
                     <div>
                       <label
@@ -2684,6 +2699,7 @@
                       >
 
                         <option value="REST">REST</option>
+                        <option value="MCP">MCP</option>
                       </select>
                     </div>
                     <div>
@@ -2696,7 +2712,16 @@
                         id="edit-tool-request-type"
                         class="mt-1 block w-full rounded-md border border-gray-300 dark:border-gray-600 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 dark:placeholder-gray-300 dark:text-gray-300"
                       >
-                        <!-- Will be populated dynamically -->
+                        <!-- Include both REST and MCP request types so existing values preselect correctly -->
+                        <!-- REST -->
+                        <option value="GET">GET</option>
+                        <option value="POST">POST</option>
+                        <option value="PUT">PUT</option>
+                        <option value="DELETE">DELETE</option>
+                        <option value="PATCH">PATCH</option>
+                        <!-- MCP transports -->
+                        <option value="SSE">SSE</option>
+                        <option value="STREAMABLEHTTP">STREAMABLEHTTP</option>
                       </select>
                     </div>
                     <div>
