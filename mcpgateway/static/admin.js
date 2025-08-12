@@ -1991,16 +1991,22 @@ async function editTool(toolId) {
             window.editToolSchemaEditor.refresh();
         }
 
-        // Trigger change event for integration type
+        // Prefill integration type from DB and set request types accordingly
         if (typeField) {
-            const event = new Event("change");
-            typeField.dispatchEvent(event);
+        typeField.value = tool.integrationType || "REST";
+        updateEditToolRequestTypes(tool.requestType || null); // preselect from DB
         }
 
-        // Set Request Type field
+        // Request Type field handling (disable for MCP)
         const requestTypeField = safeGetElement("edit-tool-request-type");
         if (requestTypeField) {
-            requestTypeField.value = tool.requestType || "SSE";
+        if ((tool.integrationType || "REST") === "MCP") {
+            requestTypeField.value = "";
+            requestTypeField.disabled = true;     // disabled -> not submitted
+        } else {
+            requestTypeField.disabled = false;
+            requestTypeField.value = tool.requestType || ""; // keep DB verb or blank
+        }
         }
 
         // Set auth type field
@@ -3560,6 +3566,7 @@ function createParameterForm(parameterCount) {
 
 const integrationRequestMap = {
     REST: ["GET", "POST", "PUT", "PATCH", "DELETE"],
+    MCP: []
 };
 
 function updateRequestTypeOptions(preselectedValue = null) {
@@ -3591,32 +3598,36 @@ function updateRequestTypeOptions(preselectedValue = null) {
 }
 
 function updateEditToolRequestTypes(selectedMethod = null) {
-    const editToolTypeSelect = safeGetElement("edit-tool-type");
-    const editToolRequestTypeSelect = safeGetElement("edit-tool-request-type");
+  const editToolTypeSelect = safeGetElement("edit-tool-type");
+  const editToolRequestTypeSelect = safeGetElement("edit-tool-request-type");
+  if (!editToolTypeSelect || !editToolRequestTypeSelect) return;
 
-    if (!editToolTypeSelect || !editToolRequestTypeSelect) {
-        return;
-    }
+  const selectedType = editToolTypeSelect.value;
+  const allowedMethods = integrationRequestMap[selectedType] || [];
 
-    const selectedType = editToolTypeSelect.value;
-    const allowedMethods = integrationRequestMap[selectedType] || [];
-
-    // Clear existing options
+  // If this integration has no HTTP verbs (MCP), clear & disable the control
+  if (allowedMethods.length === 0) {
     editToolRequestTypeSelect.innerHTML = "";
+    editToolRequestTypeSelect.value = "";
+    editToolRequestTypeSelect.disabled = true;
+    return;
+  }
 
-    // Populate new options
-    allowedMethods.forEach((method) => {
-        const option = document.createElement("option");
-        option.value = method;
-        option.textContent = method;
-        editToolRequestTypeSelect.appendChild(option);
-    });
+  // Otherwise populate and enable
+  editToolRequestTypeSelect.disabled = false;
+  editToolRequestTypeSelect.innerHTML = "";
+  allowedMethods.forEach((method) => {
+    const option = document.createElement("option");
+    option.value = method;
+    option.textContent = method;
+    editToolRequestTypeSelect.appendChild(option);
+  });
 
-    // Set the pre-selected method, if valid
-    if (selectedMethod && allowedMethods.includes(selectedMethod)) {
-        editToolRequestTypeSelect.value = selectedMethod;
-    }
+  if (selectedMethod && allowedMethods.includes(selectedMethod)) {
+    editToolRequestTypeSelect.value = selectedMethod;
+  }
 }
+
 
 // ===================================================================
 // TOOL SELECT FUNCTIONALITY
@@ -6287,8 +6298,6 @@ function setupIntegrationTypeHandlers() {
 
     const editToolTypeSelect = safeGetElement("edit-tool-type");
     if (editToolTypeSelect) {
-        editToolTypeSelect.value = "REST";
-        updateEditToolRequestTypes("PUT");
         editToolTypeSelect.addEventListener("change", () =>
             updateEditToolRequestTypes(),
         );
