@@ -246,6 +246,8 @@ app = FastAPI(
     root_path=settings.app_root_path,
     lifespan=lifespan,
 )
+app.include_router(admin_router)  
+
 
 
 # Global exceptions handlers
