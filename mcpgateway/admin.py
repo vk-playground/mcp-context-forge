@@ -94,27 +94,54 @@ rate_limit_storage = defaultdict(list)
 
 
 def rate_limit(requests_per_minute: int = None):
+    """Apply rate limiting to admin endpoints.
+
+    Args:
+        requests_per_minute: Maximum requests per minute (uses config default if None)
+
+    Returns:
+        Decorator function that enforces rate limiting
+    """
+
     def decorator(func):
+        """Decorator that wraps the function with rate limiting logic.
+
+        Args:
+            func: The function to be wrapped with rate limiting
+
+        Returns:
+            The wrapped function with rate limiting applied
+        """
+
         @wraps(func)
         async def wrapper(*args, request: Request = None, **kwargs):
+            """Execute the wrapped function with rate limiting enforcement.
+
+            Args:
+                *args: Positional arguments to pass to the wrapped function
+                request: FastAPI Request object for extracting client IP
+                **kwargs: Keyword arguments to pass to the wrapped function
+
+            Returns:
+                The result of the wrapped function call
+
+            Raises:
+                HTTPException: When rate limit is exceeded (429 status)
+            """
             # use configured limit if none provided
             limit = requests_per_minute or settings.validation_max_requests_per_minute
 
             # request can be None in some edge cases (e.g., tests)
-            client_ip = (request.client.host if request and request.client else "unknown")
+            client_ip = request.client.host if request and request.client else "unknown"
             current_time = time.time()
             minute_ago = current_time - 60
 
             # prune old timestamps
-            rate_limit_storage[client_ip] = [
-                ts for ts in rate_limit_storage[client_ip] if ts > minute_ago
-            ]
+            rate_limit_storage[client_ip] = [ts for ts in rate_limit_storage[client_ip] if ts > minute_ago]
 
             # enforce
             if len(rate_limit_storage[client_ip]) >= limit:
-                logger.warning(
-                    f"Rate limit exceeded for IP {client_ip} on endpoint {func.__name__}"
-                )
+                logger.warning(f"Rate limit exceeded for IP {client_ip} on endpoint {func.__name__}")
                 raise HTTPException(
                     status_code=429,
                     detail=f"Rate limit exceeded. Maximum {limit} requests per minute.",
@@ -124,9 +151,10 @@ def rate_limit(requests_per_minute: int = None):
 
             # IMPORTANT: forward request to the real endpoint
             return await func(*args, request=request, **kwargs)
-        return wrapper
-    return decorator
 
+        return wrapper
+
+    return decorator
 
 
 admin_router = APIRouter(prefix="/admin", tags=["Admin UI"])
@@ -4322,7 +4350,6 @@ async def admin_list_tags(
         logger.error(f"Failed to retrieve tags for admin: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve tags: {str(e)}")
 
-# admin.py
 
 @admin_router.post("/tools/import/")
 @admin_router.post("/tools/import")
@@ -4332,6 +4359,22 @@ async def admin_import_tools(
     db: Session = Depends(get_db),
     user: str = Depends(require_auth),
 ) -> JSONResponse:
+    """Bulk import multiple tools in a single request.
+
+    Accepts a JSON array of tool definitions and registers them individually.
+    Provides per-item validation and error reporting without failing the entire batch.
+
+    Args:
+        request: FastAPI Request containing the tools data
+        db: Database session
+        user: Authenticated username
+
+    Returns:
+        JSONResponse with success status, counts, and details of created/failed tools
+
+    Raises:
+        HTTPException: For authentication or rate limiting failures
+    """
     logger.debug("bulk tool import: user=%s", user)
     try:
         # ---------- robust payload parsing ----------
@@ -4360,9 +4403,9 @@ async def admin_import_tools(
         if not isinstance(payload, list):
             return JSONResponse({"success": False, "message": "Payload must be a JSON array of tools."}, status_code=422)
 
-        MAX_BATCH = 200
-        if len(payload) > MAX_BATCH:
-            return JSONResponse({"success": False, "message": f"Too many tools ({len(payload)}). Max {MAX_BATCH}."}, status_code=413)
+        max_batch = 200
+        if len(payload) > max_batch:
+            return JSONResponse({"success": False, "message": f"Too many tools ({len(payload)}). Max {max_batch}."}, status_code=413)
 
         created, errors = [], []
 
@@ -4404,7 +4447,7 @@ async def admin_import_tools(
             status_code=200,
         )
 
-    except HTTPException as ex:
+    except HTTPException:
         # let FastAPI semantics (e.g., auth) pass through
         raise
     except Exception as ex:
