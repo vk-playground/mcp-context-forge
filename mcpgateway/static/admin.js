@@ -1993,20 +1993,20 @@ async function editTool(toolId) {
 
         // Prefill integration type from DB and set request types accordingly
         if (typeField) {
-        typeField.value = tool.integrationType || "REST";
-        updateEditToolRequestTypes(tool.requestType || null); // preselect from DB
+            typeField.value = tool.integrationType || "REST";
+            updateEditToolRequestTypes(tool.requestType || null); // preselect from DB
         }
 
         // Request Type field handling (disable for MCP)
         const requestTypeField = safeGetElement("edit-tool-request-type");
         if (requestTypeField) {
-        if ((tool.integrationType || "REST") === "MCP") {
-            requestTypeField.value = "";
-            requestTypeField.disabled = true;     // disabled -> not submitted
-        } else {
-            requestTypeField.disabled = false;
-            requestTypeField.value = tool.requestType || ""; // keep DB verb or blank
-        }
+            if ((tool.integrationType || "REST") === "MCP") {
+                requestTypeField.value = "";
+                requestTypeField.disabled = true; // disabled -> not submitted
+            } else {
+                requestTypeField.disabled = false;
+                requestTypeField.value = tool.requestType || ""; // keep DB verb or blank
+            }
         }
 
         // Set auth type field
@@ -3566,7 +3566,7 @@ function createParameterForm(parameterCount) {
 
 const integrationRequestMap = {
     REST: ["GET", "POST", "PUT", "PATCH", "DELETE"],
-    MCP: []
+    MCP: [],
 };
 
 function updateRequestTypeOptions(preselectedValue = null) {
@@ -3598,36 +3598,37 @@ function updateRequestTypeOptions(preselectedValue = null) {
 }
 
 function updateEditToolRequestTypes(selectedMethod = null) {
-  const editToolTypeSelect = safeGetElement("edit-tool-type");
-  const editToolRequestTypeSelect = safeGetElement("edit-tool-request-type");
-  if (!editToolTypeSelect || !editToolRequestTypeSelect) return;
+    const editToolTypeSelect = safeGetElement("edit-tool-type");
+    const editToolRequestTypeSelect = safeGetElement("edit-tool-request-type");
+    if (!editToolTypeSelect || !editToolRequestTypeSelect) {
+        return;
+    }
 
-  const selectedType = editToolTypeSelect.value;
-  const allowedMethods = integrationRequestMap[selectedType] || [];
+    const selectedType = editToolTypeSelect.value;
+    const allowedMethods = integrationRequestMap[selectedType] || [];
 
-  // If this integration has no HTTP verbs (MCP), clear & disable the control
-  if (allowedMethods.length === 0) {
+    // If this integration has no HTTP verbs (MCP), clear & disable the control
+    if (allowedMethods.length === 0) {
+        editToolRequestTypeSelect.innerHTML = "";
+        editToolRequestTypeSelect.value = "";
+        editToolRequestTypeSelect.disabled = true;
+        return;
+    }
+
+    // Otherwise populate and enable
+    editToolRequestTypeSelect.disabled = false;
     editToolRequestTypeSelect.innerHTML = "";
-    editToolRequestTypeSelect.value = "";
-    editToolRequestTypeSelect.disabled = true;
-    return;
-  }
+    allowedMethods.forEach((method) => {
+        const option = document.createElement("option");
+        option.value = method;
+        option.textContent = method;
+        editToolRequestTypeSelect.appendChild(option);
+    });
 
-  // Otherwise populate and enable
-  editToolRequestTypeSelect.disabled = false;
-  editToolRequestTypeSelect.innerHTML = "";
-  allowedMethods.forEach((method) => {
-    const option = document.createElement("option");
-    option.value = method;
-    option.textContent = method;
-    editToolRequestTypeSelect.appendChild(option);
-  });
-
-  if (selectedMethod && allowedMethods.includes(selectedMethod)) {
-    editToolRequestTypeSelect.value = selectedMethod;
-  }
+    if (selectedMethod && allowedMethods.includes(selectedMethod)) {
+        editToolRequestTypeSelect.value = selectedMethod;
+    }
 }
-
 
 // ===================================================================
 // TOOL SELECT FUNCTIONALITY
