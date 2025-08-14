@@ -4375,6 +4375,11 @@ async def admin_import_tools(
     Raises:
         HTTPException: For authentication or rate limiting failures
     """
+    # Check if bulk import is enabled
+    if not settings.mcpgateway_bulk_import_enabled:
+        logger.warning("Bulk import attempted but feature is disabled")
+        raise HTTPException(status_code=403, detail="Bulk import feature is disabled. Enable MCPGATEWAY_BULK_IMPORT_ENABLED to use this endpoint.")
+
     logger.debug("bulk tool import: user=%s", user)
     try:
         # ---------- robust payload parsing ----------
