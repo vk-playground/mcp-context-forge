@@ -6975,19 +6975,19 @@ function setupBulkImportModal() {
         form.addEventListener("submit", async (e) => {
             e.preventDefault();
             e.stopPropagation();
-            
+
             const resultEl = safeGetElement("import-result", true);
             const indicator = safeGetElement("bulk-import-indicator", true);
-            
+
             try {
                 const formData = new FormData();
-                
+
                 // Get JSON from textarea or file
                 const jsonTextarea = form.querySelector('[name="tools_json"]');
                 const fileInput = form.querySelector('[name="tools_file"]');
-                
+
                 let hasData = false;
-                
+
                 // Check for file upload first (takes precedence)
                 if (fileInput && fileInput.files.length > 0) {
                     formData.append('tools_file', fileInput.files[0]);
@@ -7012,8 +7012,8 @@ function setupBulkImportModal() {
                         }
                         return;
                     }
-                } 
-                
+                }
+
                 if (!hasData) {
                     if (resultEl) {
                         resultEl.innerHTML = `
@@ -7024,12 +7024,12 @@ function setupBulkImportModal() {
                     }
                     return;
                 }
-                
+
                 // Show loading state
                 if (indicator) {
                     indicator.style.display = 'flex';
                 }
-                
+
                 // Submit to backend
                 const response = await fetchWithTimeout(
                     `${window.ROOT_PATH}/admin/tools/import`,
@@ -7038,9 +7038,9 @@ function setupBulkImportModal() {
                         body: formData
                     }
                 );
-                
+
                 const result = await response.json();
-                
+
                 // Display results
                 if (resultEl) {
                     if (result.success) {
@@ -7050,7 +7050,7 @@ function setupBulkImportModal() {
                                 <p class="text-sm mt-1">${escapeHtml(result.message)}</p>
                             </div>
                         `;
-                        
+
                         // Close modal and refresh page after delay
                         setTimeout(() => {
                             closeModal('bulk-import-modal');
@@ -7066,7 +7066,7 @@ function setupBulkImportModal() {
                             });
                             detailsHtml += '</ul>';
                         }
-                        
+
                         resultEl.innerHTML = `
                             <div class="mt-2 p-3 bg-yellow-100 border border-yellow-400 text-yellow-700 rounded">
                                 <p class="font-semibold">Partial Import</p>
@@ -7100,7 +7100,7 @@ function setupBulkImportModal() {
                     indicator.style.display = 'none';
                 }
             }
-            
+
             return false;
         });
     }
