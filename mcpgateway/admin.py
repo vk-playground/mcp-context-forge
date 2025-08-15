@@ -4193,10 +4193,10 @@ async def admin_import_tools(
             # Check for file upload first
             if "tools_file" in form:
                 file = form["tools_file"]
-                if hasattr(file, 'file'):
+                if hasattr(file, "file"):
                     content = await file.read()
                     try:
-                        payload = json.loads(content.decode('utf-8'))
+                        payload = json.loads(content.decode("utf-8"))
                     except (json.JSONDecodeError, UnicodeDecodeError) as ex:
                         logger.exception("Invalid JSON file")
                         return JSONResponse({"success": False, "message": f"Invalid JSON file: {ex}"}, status_code=422)
@@ -4257,8 +4257,8 @@ async def admin_import_tools(
             "total": len(payload),
             "details": {
                 "success": [item["name"] for item in created if item.get("name")],
-                "failed": [{"name": item["name"], "error": item["error"].get("message", str(item["error"]))} for item in errors]
-            }
+                "failed": [{"name": item["name"], "error": item["error"].get("message", str(item["error"]))} for item in errors],
+            },
         }
 
         if len(errors) == 0:
