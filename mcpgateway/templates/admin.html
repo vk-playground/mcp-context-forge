@@ -1325,10 +1325,6 @@
             </div>
 
             <form id="bulk-import-form"
-                  hx-post="{{ root_path }}/admin/tools/import"
-                  hx-target="#bulk-import-result"
-                  hx-swap="innerHTML"
-                  hx-indicator="#bulk-import-indicator"
                   enctype="multipart/form-data"
                   class="space-y-4 p-5">
               <p class="text-sm text-gray-600 dark:text-gray-400">
@@ -1363,7 +1359,7 @@
                 </span>
               </div>
 
-              <div id="bulk-import-result" class="pt-2"></div>
+              <div id="import-result" class="pt-2"></div>
             </form>
           </div>
         </div>

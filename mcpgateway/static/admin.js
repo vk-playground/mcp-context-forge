@@ -6968,6 +6968,27 @@ function setupBulkImportModal() {
             closeModal("bulk-import-modal", "import-result");
         }
     });
+
+    // FORM SUBMISSION → prevent default for Part 1 (UI only)
+    const form = safeGetElement("bulk-import-form", true);
+    if (form) {
+        form.addEventListener("submit", (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            
+            // Show temporary message since backend not implemented yet
+            const resultEl = safeGetElement("bulk-import-result", true);
+            if (resultEl) {
+                resultEl.innerHTML = `
+                    <div class="mt-2 p-3 bg-yellow-100 border border-yellow-400 text-yellow-700 rounded">
+                        <p class="font-semibold">Part 1 - UI Only</p>
+                        <p class="text-sm mt-1">The bulk import backend will be implemented in Part 2. Form submission prevented.</p>
+                    </div>
+                `;
+            }
+            return false;
+        });
+    }
 }
 
 document.addEventListener("DOMContentLoaded", () => {
