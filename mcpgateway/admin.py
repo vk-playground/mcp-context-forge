@@ -1980,6 +1980,176 @@ async def admin_add_tool(
         return JSONResponse(content={"message": str(ex), "success": False}, status_code=500)
 
 
+@admin_router.post("/tools/import")
+async def admin_import_tools(
+    request: Request,
+    db: Session = Depends(get_db),
+    user: str = Depends(require_auth),
+) -> JSONResponse:
+    """
+    Bulk import multiple tools from JSON.
+    
+    Accepts either:
+    - tools: JSON string containing array of tool objects
+    - tools_file: Uploaded JSON file containing array of tool objects
+    
+    Returns detailed success/failure information for each tool.
+    """
+    try:
+        form = await request.form()
+        tools_data = None
+        
+        # Check for file upload first
+        if "tools_file" in form:
+            file = form["tools_file"]
+            if hasattr(file, 'file'):
+                content = await file.read()
+                try:
+                    tools_data = json.loads(content.decode('utf-8'))
+                except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                    return JSONResponse(
+                        content={"success": False, "message": f"Invalid JSON file: {str(e)}"},
+                        status_code=400
+                    )
+        
+        # Otherwise check for direct JSON
+        elif "tools" in form:
+            try:
+                tools_data = json.loads(form["tools"])
+            except json.JSONDecodeError as e:
+                return JSONResponse(
+                    content={"success": False, "message": f"Invalid JSON: {str(e)}"},
+                    status_code=400
+                )
+        
+        if not tools_data:
+            return JSONResponse(
+                content={"success": False, "message": "No data provided. Please provide JSON data or upload a file."},
+                status_code=400
+            )
+        
+        # Validate it's an array
+        if not isinstance(tools_data, list):
+            return JSONResponse(
+                content={"success": False, "message": "JSON must be an array of tool objects"},
+                status_code=400
+            )
+        
+        # Enforce maximum limit
+        if len(tools_data) > 200:
+            return JSONResponse(
+                content={"success": False, "message": "Maximum 200 tools allowed per import"},
+                status_code=400
+            )
+        
+        # Process each tool
+        results = {"success": [], "failed": []}
+        
+        for idx, tool_data in enumerate(tools_data):
+            tool_name = tool_data.get("name", f"tool_{idx}")
+            
+            try:
+                # Map fields to match existing admin_add_tool expectations
+                mapped_data = {
+                    "name": tool_data.get("name"),
+                    "url": tool_data.get("url"),
+                    "description": tool_data.get("description", ""),
+                    "request_type": tool_data.get("requestType", tool_data.get("request_type", "SSE")),
+                    "integration_type": tool_data.get("integrationType", tool_data.get("integration_type", "MCP")),
+                    "headers": tool_data.get("headers", {}),
+                    "input_schema": tool_data.get("inputSchema", tool_data.get("input_schema", {})),
+                    "jsonpath_filter": tool_data.get("jsonpath_filter", ""),
+                    "auth_type": tool_data.get("authType", tool_data.get("auth_type", "none")),
+                }
+                
+                # Add auth fields if present
+                if "authConfig" in tool_data:
+                    auth_config = tool_data["authConfig"]
+                    mapped_data.update({
+                        "auth_username": auth_config.get("username", ""),
+                        "auth_password": auth_config.get("password", ""),
+                        "auth_token": auth_config.get("token", ""),
+                        "auth_header_key": auth_config.get("headerKey", ""),
+                        "auth_header_value": auth_config.get("headerValue", ""),
+                    })
+                
+                # Validate required fields
+                if not mapped_data["name"]:
+                    raise ValueError("Tool name is required")
+                if not mapped_data["url"]:
+                    raise ValueError("Tool URL is required")
+                
+                # Ensure headers and input_schema are properly formatted
+                if isinstance(mapped_data["headers"], dict):
+                    mapped_data["headers"] = json.dumps(mapped_data["headers"])
+                if isinstance(mapped_data["input_schema"], dict):
+                    mapped_data["input_schema"] = json.dumps(mapped_data["input_schema"])
+                
+                # Register the tool using existing service
+                await tool_service.register_tool(
+                    db=db,
+                    name=mapped_data["name"],
+                    url=mapped_data["url"],
+                    description=mapped_data["description"],
+                    request_type=mapped_data["request_type"],
+                    integration_type=mapped_data["integration_type"],
+                    headers=mapped_data["headers"],
+                    input_schema=mapped_data["input_schema"],
+                    jsonpath_filter=mapped_data["jsonpath_filter"],
+                    auth_type=mapped_data["auth_type"],
+                    auth_username=mapped_data.get("auth_username", ""),
+                    auth_password=mapped_data.get("auth_password", ""),
+                    auth_token=mapped_data.get("auth_token", ""),
+                    auth_header_key=mapped_data.get("auth_header_key", ""),
+                    auth_header_value=mapped_data.get("auth_header_value", ""),
+                )
+                
+                results["success"].append(tool_name)
+                
+            except IntegrityError as e:
+                db.rollback()
+                results["failed"].append({
+                    "name": tool_name,
+                    "error": f"Duplicate tool name or database constraint violation"
+                })
+            except Exception as e:
+                db.rollback()
+                results["failed"].append({
+                    "name": tool_name,
+                    "error": str(e)
+                })
+        
+        # Prepare response
+        total = len(tools_data)
+        imported = len(results["success"])
+        failed = len(results["failed"])
+        
+        response_data = {
+            "success": failed == 0,
+            "imported": imported,
+            "failed": failed,
+            "total": total,
+            "details": results
+        }
+        
+        if failed == 0:
+            response_data["message"] = f"Successfully imported all {imported} tools"
+        else:
+            response_data["message"] = f"Imported {imported} of {total} tools. {failed} failed."
+        
+        return JSONResponse(
+            content=response_data,
+            status_code=200 if failed == 0 else 207  # 207 Multi-Status for partial success
+        )
+        
+    except Exception as ex:
+        logger.error(f"Unexpected error in admin_import_tools: {str(ex)}")
+        return JSONResponse(
+            content={"success": False, "message": f"Import failed: {str(ex)}"},
+            status_code=500
+        )
+
+
 @admin_router.post("/tools/{tool_id}/edit/", response_model=None)
 @admin_router.post("/tools/{tool_id}/edit", response_model=None)
 async def admin_edit_tool(
