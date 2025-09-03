@@ -15,6 +15,7 @@ It also publishes event notifications for server changes.
 import asyncio
 from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, Dict, List, Optional
+import uuid as uuid_module
 
 # Third-Party
 import httpx
@@ -299,6 +300,7 @@ class ServerService:
             >>> service = ServerService()
             >>> db = MagicMock()
             >>> server_in = MagicMock()
+            >>> server_in.id = None  # No custom UUID for this test
             >>> db.execute.return_value.scalar_one_or_none.return_value = None
             >>> db.add = MagicMock()
             >>> db.commit = MagicMock()
