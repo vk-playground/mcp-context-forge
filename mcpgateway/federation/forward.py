@@ -778,3 +778,8 @@ class ForwardingService:
         )
         db.add(metric)
         db.commit()
+        
+        try:  # pragma: no cover
+            db.expire(gateway, ["metrics"])
+        except Exception:  # noqa: BLE001
+            pass
