@@ -17,7 +17,6 @@ It handles:
 # Standard
 import asyncio
 from datetime import datetime, timezone
-import os
 from string import Formatter
 import time
 from typing import Any, AsyncGenerator, Dict, List, Optional, Set
@@ -39,7 +38,6 @@ from mcpgateway.plugins.framework import GlobalContext, PluginManager, PluginVio
 from mcpgateway.schemas import PromptCreate, PromptRead, PromptUpdate, TopPerformer
 from mcpgateway.services.logging_service import LoggingService
 from mcpgateway.utils.metrics_common import build_top_performers
-from mcpgateway.utils.sqlalchemy_modifier import json_contains_expr
 
 # Initialize logging service first
 logging_service = LoggingService()
@@ -123,15 +121,7 @@ class PromptService:
         """
         self._event_subscribers: List[asyncio.Queue] = []
         self._jinja_env = Environment(autoescape=select_autoescape(["html", "xml"]), trim_blocks=True, lstrip_blocks=True)
-        # Initialize plugin manager with env overrides for testability
-        env_flag = os.getenv("PLUGINS_ENABLED")
-        if env_flag is not None:
-            env_enabled = env_flag.strip().lower() in {"1", "true", "yes", "on"}
-            plugins_enabled = env_enabled
-        else:
-            plugins_enabled = settings.plugins_enabled
-        config_file = os.getenv("PLUGIN_CONFIG_FILE", getattr(settings, "plugin_config_file", "plugins/config.yaml"))
-        self._plugin_manager: PluginManager | None = PluginManager(config_file) if plugins_enabled else None
+        self._plugin_manager: PluginManager | None = PluginManager() if settings.plugins_enabled else None
 
     async def initialize(self) -> None:
         """Initialize the service."""
@@ -198,19 +188,16 @@ class PromptService:
             
         results = query.all()
 
-        if limit is not None:
-            query = query.limit(limit)
-
-        results = query.all()        
-
         return build_top_performers(results)
 
     async def _record_prompt_metric(self, db: Session, prompt: DbPrompt, start_time: float, success: bool, error_message: Optional[str]) -> None:
         """
         Records a metric for a prompt invocation.
+
         This function calculates the response time using the provided start time and records
         the metric details (including whether the invocation was successful and any error message)
         into the database. The metric is then committed to the database.
+
         Args:
             db (Session): The SQLAlchemy database session.
             prompt (DbPrompt): The prompt that was invoked.
@@ -228,7 +215,11 @@ class PromptService:
         )
         db.add(metric)
         db.commit()
-    
+        # Expire metrics relationship for accurate immediate aggregation
+        try:  # pragma: no cover
+            db.expire(prompt, ["metrics"])
+        except Exception:  # noqa: BLE001
+            pass
 
     def _convert_db_prompt(self, db_prompt: DbPrompt) -> Dict[str, Any]:
         """
@@ -294,9 +285,6 @@ class PromptService:
         created_user_agent: Optional[str] = None,
         import_batch_id: Optional[str] = None,
         federation_source: Optional[str] = None,
-        team_id: Optional[str] = None,
-        owner_email: Optional[str] = None,
-        visibility: str = "private",
     ) -> PromptRead:
         """Register a new prompt template.
 
@@ -309,9 +297,6 @@ class PromptService:
             created_user_agent: User agent of creation request
             import_batch_id: UUID for bulk import operations
             federation_source: Source gateway for federated prompts
-            team_id (Optional[str]): Team ID to assign the prompt to.
-            owner_email (Optional[str]): Email of the user who owns this prompt.
-            visibility (str): Prompt visibility level (private, team, public).
 
         Returns:
             Created prompt information
@@ -372,10 +357,6 @@ class PromptService:
                 import_batch_id=import_batch_id,
                 federation_source=federation_source,
                 version=1,
-                # Team scoping fields - use schema values if provided, otherwise fallback to parameters
-                team_id=getattr(prompt, "team_id", None) or team_id,
-                owner_email=getattr(prompt, "owner_email", None) or owner_email or created_by,
-                visibility=getattr(prompt, "visibility", None) or visibility,
             )
 
             # Add to DB
@@ -438,83 +419,15 @@ class PromptService:
 
         # Add tag filtering if tags are provided
         if tags:
-            query = query.where(json_contains_expr(db, DbPrompt.tags, tags, match_any=True))
+            # Filter prompts that have any of the specified tags
+            tag_conditions = []
+            for tag in tags:
+                tag_conditions.append(func.json_contains(DbPrompt.tags, f'"{tag}"'))
+            if tag_conditions:
+                query = query.where(func.or_(*tag_conditions))
 
         # Cursor-based pagination logic can be implemented here in the future.
         logger.debug(cursor)
-        prompts = db.execute(query).scalars().all()
-        return [PromptRead.model_validate(self._convert_db_prompt(p)) for p in prompts]
-
-    async def list_prompts_for_user(
-        self, db: Session, user_email: str, team_id: Optional[str] = None, visibility: Optional[str] = None, include_inactive: bool = False, skip: int = 0, limit: int = 100
-    ) -> List[PromptRead]:
-        """
-        List prompts user has access to with team filtering.
-
-        Args:
-            db: Database session
-            user_email: Email of the user requesting prompts
-            team_id: Optional team ID to filter by specific team
-            visibility: Optional visibility filter (private, team, public)
-            include_inactive: Whether to include inactive prompts
-            skip: Number of prompts to skip for pagination
-            limit: Maximum number of prompts to return
-
-        Returns:
-            List[PromptRead]: Prompts the user has access to
-        """
-        # First-Party
-        from mcpgateway.services.team_management_service import TeamManagementService  # pylint: disable=import-outside-toplevel
-
-        # Build query following existing patterns from list_prompts()
-        query = select(DbPrompt)
-
-        # Apply active/inactive filter
-        if not include_inactive:
-            query = query.where(DbPrompt.is_active)
-
-        if team_id:
-            # Filter by specific team
-            query = query.where(DbPrompt.team_id == team_id)
-
-            # Validate user has access to team
-            team_service = TeamManagementService(db)
-            user_teams = await team_service.get_user_teams(user_email)
-            team_ids = [team.id for team in user_teams]
-
-            if team_id not in team_ids:
-                return []  # No access to team
-        else:
-            # Get user's accessible teams
-            team_service = TeamManagementService(db)
-            user_teams = await team_service.get_user_teams(user_email)
-            team_ids = [team.id for team in user_teams]
-
-            # Build access conditions following existing patterns
-            # Third-Party
-            from sqlalchemy import and_, or_  # pylint: disable=import-outside-toplevel
-
-            access_conditions = []
-
-            # 1. User's personal resources (owner_email matches)
-            access_conditions.append(DbPrompt.owner_email == user_email)
-
-            # 2. Team resources where user is member
-            if team_ids:
-                access_conditions.append(and_(DbPrompt.team_id.in_(team_ids), DbPrompt.visibility.in_(["team", "public"])))
-
-            # 3. Public resources (if visibility allows)
-            access_conditions.append(DbPrompt.visibility == "public")
-
-            query = query.where(or_(*access_conditions))
-
-        # Apply visibility filter if specified
-        if visibility:
-            query = query.where(DbPrompt.visibility == visibility)
-
-        # Apply pagination following existing patterns
-        query = query.offset(skip).limit(limit)
-
         prompts = db.execute(query).scalars().all()
         return [PromptRead.model_validate(self._convert_db_prompt(p)) for p in prompts]
 
@@ -607,7 +520,7 @@ class PromptService:
         success = False
         error_message = None
         prompt = None
-        
+
         # Create a trace span for prompt rendering
         with create_span(
             "prompt.render",
@@ -727,7 +640,6 @@ class PromptService:
                 # Record metric regardless of success or failure
                 if prompt:
                     await self._record_prompt_metric(db, prompt, start_time, success, error_message)
-
 
     async def update_prompt(self, db: Session, name: str, prompt_update: PromptUpdate) -> PromptRead:
         """
