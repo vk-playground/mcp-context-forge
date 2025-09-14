@@ -52,7 +52,6 @@ from mcpgateway.utils.metrics_common import build_top_performers
 from mcpgateway.utils.passthrough_headers import get_passthrough_headers
 from mcpgateway.utils.retry_manager import ResilientHttpClient
 from mcpgateway.utils.services_auth import decode_auth
-from mcpgateway.utils.sqlalchemy_modifier import json_contains_expr
 
 # Local
 from ..config import extract_using_jq
@@ -240,18 +239,10 @@ class ToolService:
             .order_by(desc("execution_count"))
         )
         
-<<<<<<< HEAD
-
-        if limit is not None:
-            query = query.limit(limit)
-
-        results = query.all()        
-=======
         if limit is not None:
             query = query.limit(limit)
             
         results = query.all()
->>>>>>> 394d8139 (Implement metrics enhancements and testing scripts for issue #699)
 
         return build_top_performers(results)
 
@@ -328,6 +319,13 @@ class ToolService:
         )
         db.add(metric)
         db.commit()
+        # Ensure the in-memory relationship collection is expired so that
+        # subsequent accesses to tool.metrics / derived properties (execution_count,
+        # metrics_summary, last_execution_time, etc.) reflect the newly added metric.
+        try:  # pragma: no cover - defensive; expire won't raise in normal conditions
+            db.expire(tool, ["metrics"])
+        except Exception:  # noqa: BLE001
+            pass
 
     async def register_tool(
         self,
@@ -339,12 +337,6 @@ class ToolService:
         created_user_agent: Optional[str] = None,
         import_batch_id: Optional[str] = None,
         federation_source: Optional[str] = None,
-<<<<<<< HEAD
-        team_id: Optional[str] = None,
-        owner_email: Optional[str] = None,
-        visibility: str = None,
-=======
->>>>>>> 394d8139 (Implement metrics enhancements and testing scripts for issue #699)
     ) -> ToolRead:
         """Register a new tool.
 
@@ -395,15 +387,6 @@ class ToolService:
             else:
                 auth_type = tool.auth.auth_type
                 auth_value = tool.auth.auth_value
-
-            if team_id is None:
-                team_id = tool.team_id
-
-            if owner_email is None:
-                owner_email = tool.owner_email
-
-            if visibility is None:
-                visibility = tool.visibility or "private"
 
             db_tool = DbTool(
                 original_name=tool.name,
@@ -484,16 +467,12 @@ class ToolService:
 
         # Add tag filtering if tags are provided
         if tags:
-<<<<<<< HEAD
-            query = query.where(json_contains_expr(db, DbTool.tags, tags, match_any=True))
-=======
             # Filter tools that have any of the specified tags
             tag_conditions = []
             for tag in tags:
                 tag_conditions.append(func.json_contains(DbTool.tags, f'"{tag}"'))
             if tag_conditions:
                 query = query.where(func.or_(*tag_conditions))
->>>>>>> 394d8139 (Implement metrics enhancements and testing scripts for issue #699)
 
         tools = db.execute(query).scalars().all()
         return [self._convert_tool_to_read(t) for t in tools]
@@ -536,81 +515,6 @@ class ToolService:
         tools = db.execute(query).scalars().all()
         return [self._convert_tool_to_read(t) for t in tools]
 
-<<<<<<< HEAD
-    async def list_tools_for_user(
-        self, db: Session, user_email: str, team_id: Optional[str] = None, visibility: Optional[str] = None, include_inactive: bool = False, skip: int = 0, limit: int = 100
-    ) -> List[ToolRead]:
-        """
-        List tools user has access to with team filtering.
-
-        Args:
-            db: Database session
-            user_email: Email of the user requesting tools
-            team_id: Optional team ID to filter by specific team
-            visibility: Optional visibility filter (private, team, public)
-            include_inactive: Whether to include inactive tools
-            skip: Number of tools to skip for pagination
-            limit: Maximum number of tools to return
-
-        Returns:
-            List[ToolRead]: Tools the user has access to
-        """
-
-        # Build query following existing patterns from list_tools()
-        query = select(DbTool)
-
-        # Apply active/inactive filter
-        if not include_inactive:
-            query = query.where(DbTool.enabled.is_(True))
-
-        if team_id:
-            # Filter by specific team
-            query = query.where(DbTool.team_id == team_id)
-
-            # Validate user has access to team
-            team_service = TeamManagementService(db)
-            user_teams = await team_service.get_user_teams(user_email)
-            team_ids = [team.id for team in user_teams]
-
-            if team_id not in team_ids:
-                return []  # No access to team
-        else:
-            # Get user's accessible teams
-            team_service = TeamManagementService(db)
-            user_teams = await team_service.get_user_teams(user_email)
-            team_ids = [team.id for team in user_teams]
-
-            # Build access conditions following existing patterns
-
-            access_conditions = []
-
-            # 1. User's personal resources (owner_email matches)
-            access_conditions.append(DbTool.owner_email == user_email)
-
-            # 2. Team resources where user is member
-            if team_ids:
-                access_conditions.append(and_(DbTool.team_id.in_(team_ids), DbTool.visibility.in_(["team", "public"])))
-
-            # 3. Public resources (if visibility allows)
-            access_conditions.append(DbTool.visibility == "public")
-
-            query = query.where(or_(*access_conditions))
-
-        # Apply visibility filter if specified
-        if visibility:
-            query = query.where(DbTool.visibility == visibility)
-
-        # Filter out private tools not owned by the user and are private
-        query = query.where(~((DbTool.owner_email != user_email) & (DbTool.visibility == "private")))
-
-        # Apply pagination following existing patterns
-        query = query.offset(skip).limit(limit)
-
-        tools = db.execute(query).scalars().all()
-        return [self._convert_tool_to_read(t) for t in tools]
-
-=======
->>>>>>> 394d8139 (Implement metrics enhancements and testing scripts for issue #699)
     async def get_tool(self, db: Session, tool_id: str) -> ToolRead:
         """
         Retrieve a tool by its ID.
@@ -1130,8 +1034,6 @@ class ToolService:
                 tool.annotations = tool_update.annotations
             if tool_update.jsonpath_filter is not None:
                 tool.jsonpath_filter = tool_update.jsonpath_filter
-            if tool_update.visibility is not None:
-                tool.visibility = tool_update.visibility
 
             if tool_update.auth is not None:
                 if tool_update.auth.auth_type is not None:
@@ -1542,6 +1444,10 @@ class ToolService:
             )
             db.add(metric)
             db.commit()
+            try:  # Ensure subsequent accesses see fresh metrics
+                db.expire(tool, ["metrics"])
+            except Exception:  # noqa: BLE001
+                pass
 
         return result
 
