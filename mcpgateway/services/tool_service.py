@@ -242,6 +242,7 @@ class ToolService:
                 - success_rate: Success rate percentage, or None if no metrics.
                 - last_execution: Timestamp of the last execution, or None if no metrics.
         """
+         # Build query to aggregate tool metrics and rank by execution count
         query = (
             db.query(
                 DbTool.id,
