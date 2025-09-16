@@ -189,7 +189,6 @@ class ServerService:
 
         return build_top_performers(results)
 
-        return build_top_performers(results)
 
     def _convert_server_to_read(self, server: DbServer) -> ServerRead:
         """
