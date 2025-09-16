@@ -193,7 +193,8 @@ class PromptService:
             .order_by(desc("execution_count"))
         )
         
-        if limit is not None:
+        # If a limit is provided (default 5), cap the number of rows returned
+        if limit is not None: 
             query = query.limit(limit)
             
         results = query.all()
