@@ -151,7 +151,7 @@ class ResourceService:
         self._event_subscribers.clear()
         logger.info("Resource service shutdown complete")
 
-    async def get_top_resources(self, db: Session, limit: int = 5) -> List[TopPerformer]:
+    async def get_top_resources(self, db: Session, limit: Optional[int] = 5) -> List[TopPerformer]:
         """Retrieve the top-performing resources based on execution count.
 
         Queries the database to get resources with their metrics, ordered by the number of executions
@@ -160,7 +160,8 @@ class ResourceService:
 
         Args:
             db (Session): Database session for querying resource metrics.
-            limit (int): Maximum number of resources to return. Defaults to 5.
+            limit (Optional[int]): Maximum number of resources to return. Defaults to 5.
+                If None, returns all resources.
 
         Returns:
             List[TopPerformer]: A list of TopPerformer objects, each containing:
@@ -171,7 +172,7 @@ class ResourceService:
                 - success_rate: Success rate percentage, or None if no metrics.
                 - last_execution: Timestamp of the last execution, or None if no metrics.
         """
-        results = (
+        query = (
             db.query(
                 DbResource.id,
                 DbResource.uri.label("name"),  # Using URI as the name field for TopPerformer
@@ -189,12 +190,15 @@ class ResourceService:
             .outerjoin(ResourceMetric)
             .group_by(DbResource.id, DbResource.uri)
             .order_by(desc("execution_count"))
-            .limit(limit)
-            .all()
         )
+        
+        if limit is not None:
+            query = query.limit(limit)
+            
+        results = query.all()
 
         return build_top_performers(results)
-    
+
     async def _record_resource_metric(self, db: Session, resource: DbResource, start_time: float, success: bool, error_message: Optional[str]) -> None:
         """
         Records a metric for a resource access.
@@ -220,6 +224,11 @@ class ResourceService:
         )
         db.add(metric)
         db.commit()
+        # Expire metrics relationship so subsequent accesses re-query fresh data
+        try:  # pragma: no cover
+            db.expire(resource, ["metrics"])
+        except Exception:  # noqa: BLE001
+            pass
 
     def _convert_resource_to_read(self, resource: DbResource) -> ResourceRead:
         """
@@ -627,7 +636,7 @@ class ResourceService:
         start_time = time.monotonic()
         success = False
         error_message = None
-        resource = None        
+        resource = None
 
         # Create trace span for resource reading
         with create_span(
@@ -648,6 +657,7 @@ class ResourceService:
 
                 original_uri = uri
                 contexts = None
+                global_context = None
 
                 # Call pre-fetch hooks if plugin manager is available
                 if self._plugin_manager and PLUGINS_AVAILABLE:
@@ -705,7 +715,7 @@ class ResourceService:
                     content = resource.content
 
                 # Call post-fetch hooks if plugin manager is available
-                if self._plugin_manager and PLUGINS_AVAILABLE:
+                if self._plugin_manager and PLUGINS_AVAILABLE and global_context:
                     # Create post-fetch payload
                     post_payload = ResourcePostFetchPayload(uri=original_uri, content=content)
 

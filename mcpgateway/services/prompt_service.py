@@ -152,7 +152,7 @@ class PromptService:
         self._event_subscribers.clear()
         logger.info("Prompt service shutdown complete")
 
-    async def get_top_prompts(self, db: Session, limit: int = 5) -> List[TopPerformer]:
+    async def get_top_prompts(self, db: Session, limit: Optional[int] = 5) -> List[TopPerformer]:
         """Retrieve the top-performing prompts based on execution count.
 
         Queries the database to get prompts with their metrics, ordered by the number of executions
@@ -161,7 +161,8 @@ class PromptService:
 
         Args:
             db (Session): Database session for querying prompt metrics.
-            limit (int): Maximum number of prompts to return. Defaults to 5.
+            limit (Optional[int]): Maximum number of prompts to return. Defaults to 5.
+                If None, returns all prompts.
 
         Returns:
             List[TopPerformer]: A list of TopPerformer objects, each containing:
@@ -172,7 +173,7 @@ class PromptService:
                 - success_rate: Success rate percentage, or None if no metrics.
                 - last_execution: Timestamp of the last execution, or None if no metrics.
         """
-        results = (
+        query = (
             db.query(
                 DbPrompt.id,
                 DbPrompt.name,
@@ -190,12 +191,15 @@ class PromptService:
             .outerjoin(PromptMetric)
             .group_by(DbPrompt.id, DbPrompt.name)
             .order_by(desc("execution_count"))
-            .limit(limit)
-            .all()
         )
+        
+        if limit is not None:
+            query = query.limit(limit)
+            
+        results = query.all()
 
         return build_top_performers(results)
-    
+
     async def _record_prompt_metric(self, db: Session, prompt: DbPrompt, start_time: float, success: bool, error_message: Optional[str]) -> None:
         """
         Records a metric for a prompt invocation.
@@ -221,6 +225,11 @@ class PromptService:
         )
         db.add(metric)
         db.commit()
+        # Expire metrics relationship for accurate immediate aggregation
+        try:  # pragma: no cover
+            db.expire(prompt, ["metrics"])
+        except Exception:  # noqa: BLE001
+            pass
 
     def _convert_db_prompt(self, db_prompt: DbPrompt) -> Dict[str, Any]:
         """
@@ -608,7 +617,7 @@ class PromptService:
         start_time = time.monotonic()
         success = False
         error_message = None
-        prompt = None        
+        prompt = None
 
         # Create a trace span for prompt rendering
         with create_span(
@@ -647,8 +656,6 @@ class PromptService:
                             arguments = payload.args
                     except PluginViolationError:
                         raise
-
-            # Find prompt
                     except Exception as e:
                         logger.error(f"Error in pre-prompt fetch plugin hook: {e}")
                         # Only fail if configured to do so
@@ -704,7 +711,6 @@ class PromptService:
                             result = post_result.modified_payload.result
                     except PluginViolationError:
                         raise
-
                     except Exception as e:
                         logger.error(f"Error in post-prompt fetch plugin hook: {e}")
                         # Only fail if configured to do so
@@ -732,7 +738,6 @@ class PromptService:
                 # Record metric regardless of success or failure
                 if prompt:
                     await self._record_prompt_metric(db, prompt, start_time, success, error_message)
-
 
     async def update_prompt(
         self,
