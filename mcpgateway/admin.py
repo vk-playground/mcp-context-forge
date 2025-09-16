@@ -2269,7 +2269,7 @@ async def admin_edit_tool(
         tool_data["request_type"] = form.get("requestType")
     if logger: logger.debug(f"Tool update data built: {tool_data}")
     try:
-        tool = ToolUpdate(**tool_data)  # Pydantic validation happens here
+        tool = ToolUpdate(**tool_data)  # Pydantic validation happens here; raises ValidationError on bad input
 
         # Get current tool to extract current version
         current_tool = db.get(DbTool, tool_id)
