@@ -1,6 +1,7 @@
 """
 Simple test script to directly test the metrics calculation functions in issue #699.
 """
+
 import sys
 import os
 
