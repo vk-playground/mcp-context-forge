@@ -19,6 +19,7 @@ import asyncio
 import base64
 from datetime import datetime, timezone
 import json
+import os
 import re
 import time
 from typing import Any, AsyncGenerator, Dict, List, Optional
@@ -30,7 +31,7 @@ import httpx
 from mcp import ClientSession
 from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamablehttp_client
-from sqlalchemy import case, delete, desc, Float, func, not_, select
+from sqlalchemy import and_, case, delete, desc, Float, func, not_, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -47,11 +48,14 @@ from mcpgateway.plugins.framework import GlobalContext, PluginManager, PluginVio
 from mcpgateway.schemas import ToolCreate, ToolRead, ToolUpdate, TopPerformer
 from mcpgateway.services.logging_service import LoggingService
 from mcpgateway.services.oauth_manager import OAuthManager
+from mcpgateway.services.team_management_service import TeamManagementService
 from mcpgateway.utils.create_slug import slugify
+from mcpgateway.utils.display_name import generate_display_name
 from mcpgateway.utils.metrics_common import build_top_performers
 from mcpgateway.utils.passthrough_headers import get_passthrough_headers
 from mcpgateway.utils.retry_manager import ResilientHttpClient
 from mcpgateway.utils.services_auth import decode_auth
+from mcpgateway.utils.sqlalchemy_modifier import json_contains_expr
 
 # Local
 from ..config import extract_using_jq
@@ -88,19 +92,20 @@ class ToolNotFoundError(ToolError):
 class ToolNameConflictError(ToolError):
     """Raised when a tool name conflicts with existing (active or inactive) tool."""
 
-    def __init__(self, name: str, enabled: bool = True, tool_id: Optional[int] = None):
+    def __init__(self, name: str, enabled: bool = True, tool_id: Optional[int] = None, visibility: str = "public"):
         """Initialize the error with tool information.
 
         Args:
             name: The conflicting tool name.
             enabled: Whether the existing tool is enabled or not.
             tool_id: ID of the existing tool if available.
+            visibility: The visibility of the tool ("public" or "team").
 
         Examples:
             >>> from mcpgateway.services.tool_service import ToolNameConflictError
             >>> err = ToolNameConflictError('test_tool', enabled=False, tool_id=123)
             >>> str(err)
-            'Tool already exists with name: test_tool (currently inactive, ID: 123)'
+            'Public Tool already exists with name: test_tool (currently inactive, ID: 123)'
             >>> err.name
             'test_tool'
             >>> err.enabled
@@ -111,7 +116,11 @@ class ToolNameConflictError(ToolError):
         self.name = name
         self.enabled = enabled
         self.tool_id = tool_id
-        message = f"Tool already exists with name: {name}"
+        if visibility == "team":
+            vis_label = "Team-level"
+        else:
+            vis_label = "Public"
+        message = f"{vis_label} Tool already exists with name: {name}"
         if not enabled:
             message += f" (currently inactive, ID: {tool_id})"
         super().__init__(message)
@@ -135,9 +144,15 @@ class ToolInvocationError(ToolError):
 
     Examples:
         >>> from mcpgateway.services.tool_service import ToolInvocationError
-        >>> err = ToolInvocationError("Failed to invoke tool")
+        >>> err = ToolInvocationError("Tool execution failed")
         >>> str(err)
-        'Failed to invoke tool'
+        'Tool execution failed'
+        >>> isinstance(err, ToolError)
+        True
+        >>> # Test with detailed error
+        >>> detailed_err = ToolInvocationError("Network timeout after 30 seconds")
+        >>> "timeout" in str(detailed_err)
+        True
         >>> isinstance(err, ToolError)
         True
     """
@@ -169,7 +184,15 @@ class ToolService:
         """
         self._event_subscribers: List[asyncio.Queue] = []
         self._http_client = ResilientHttpClient(client_args={"timeout": settings.federation_timeout, "verify": not settings.skip_ssl_verify})
-        self._plugin_manager: PluginManager | None = PluginManager() if settings.plugins_enabled else None
+        # Initialize plugin manager with env overrides to ease testing
+        env_flag = os.getenv("PLUGINS_ENABLED")
+        if env_flag is not None:
+            env_enabled = env_flag.strip().lower() in {"1", "true", "yes", "on"}
+            plugins_enabled = env_enabled
+        else:
+            plugins_enabled = settings.plugins_enabled
+        config_file = os.getenv("PLUGIN_CONFIG_FILE", getattr(settings, "plugin_config_file", "plugins/config.yaml"))
+        self._plugin_manager: PluginManager | None = PluginManager(config_file) if plugins_enabled else None
         self.oauth_manager = OAuthManager(
             request_timeout=int(settings.oauth_request_timeout if hasattr(settings, "oauth_request_timeout") else 30),
             max_retries=int(settings.oauth_max_retries if hasattr(settings, "oauth_max_retries") else 3),
@@ -287,10 +310,14 @@ class ToolService:
             tool_dict["auth"] = None
 
         tool_dict["name"] = tool.name
-        tool_dict["custom_name"] = tool.custom_name
-        tool_dict["gateway_slug"] = tool.gateway_slug if tool.gateway_slug else ""
-        tool_dict["custom_name_slug"] = tool.custom_name_slug
-        tool_dict["tags"] = tool.tags or []
+        # Handle displayName with fallback and None checks
+        display_name = getattr(tool, "display_name", None)
+        custom_name = getattr(tool, "custom_name", tool.original_name)
+        tool_dict["displayName"] = display_name or custom_name
+        tool_dict["custom_name"] = custom_name
+        tool_dict["gateway_slug"] = getattr(tool, "gateway_slug", "") or ""
+        tool_dict["custom_name_slug"] = getattr(tool, "custom_name_slug", "") or ""
+        tool_dict["tags"] = getattr(tool, "tags", []) or []
 
         return ToolRead.model_validate(tool_dict)
 
@@ -337,8 +364,11 @@ class ToolService:
         created_user_agent: Optional[str] = None,
         import_batch_id: Optional[str] = None,
         federation_source: Optional[str] = None,
+        team_id: Optional[str] = None,
+        owner_email: Optional[str] = None,
+        visibility: str = None,
     ) -> ToolRead:
-        """Register a new tool.
+        """Register a new tool with team support.
 
         Args:
             db: Database session.
@@ -349,12 +379,16 @@ class ToolService:
             created_user_agent: User agent of creation request.
             import_batch_id: UUID for bulk import operations.
             federation_source: Source gateway for federated tools.
+            team_id: Optional team ID to assign tool to.
+            owner_email: Optional owner email for tool ownership.
+            visibility: Tool visibility (private, team, public).
 
         Returns:
             Created tool information.
 
         Raises:
             IntegrityError: If there is a database integrity error.
+            ToolNameConflictError: If a tool with the same name and visibility public exists.
             ToolError: For other tool registration errors.
 
         Examples:
@@ -388,10 +422,32 @@ class ToolService:
                 auth_type = tool.auth.auth_type
                 auth_value = tool.auth.auth_value
 
+            if team_id is None:
+                team_id = tool.team_id
+
+            if owner_email is None:
+                owner_email = tool.owner_email
+            if visibility is None:
+                visibility = tool.visibility or "private"
+            # Check for existing tool with the same name and visibility
+            if visibility.lower() == "public":
+                # Check for existing public tool with the same name
+                existing_tool = db.execute(select(DbTool).where(DbTool.name == tool.name, DbTool.visibility == "public")).scalar_one_or_none()
+                if existing_tool:
+                    raise ToolNameConflictError(existing_tool.name, enabled=existing_tool.enabled, tool_id=existing_tool.id, visibility=existing_tool.visibility)
+            elif visibility.lower() == "team" and team_id:
+                # Check for existing team tool with the same name, team_id
+                existing_tool = db.execute(
+                    select(DbTool).where(DbTool.name == tool.name, DbTool.visibility == "team", DbTool.team_id == team_id)  # pylint: disable=comparison-with-callable
+                ).scalar_one_or_none()
+                if existing_tool:
+                    raise ToolNameConflictError(existing_tool.name, enabled=existing_tool.enabled, tool_id=existing_tool.id, visibility=existing_tool.visibility)
+
             db_tool = DbTool(
                 original_name=tool.name,
                 custom_name=tool.name,
                 custom_name_slug=slugify(tool.name),
+                display_name=tool.displayName or tool.name,
                 url=str(tool.url),
                 description=tool.description,
                 integration_type=tool.integration_type,
@@ -412,6 +468,10 @@ class ToolService:
                 import_batch_id=import_batch_id,
                 federation_source=federation_source,
                 version=1,
+                # Team scoping fields
+                team_id=team_id,
+                owner_email=owner_email or created_by,
+                visibility=visibility,
             )
             db.add(db_tool)
             db.commit()
@@ -422,7 +482,11 @@ class ToolService:
         except IntegrityError as ie:
             db.rollback()
             logger.error(f"IntegrityError during tool registration: {ie}")
-            raise ToolError(f"Tool already exists: {tool.name}")
+            raise ie
+        except ToolNameConflictError as tnce:
+            db.rollback()
+            logger.error(f"ToolNameConflictError during tool registration: {tnce}")
+            raise tnce
         except Exception as e:
             db.rollback()
             raise ToolError(f"Failed to register tool: {str(e)}")
@@ -467,12 +531,7 @@ class ToolService:
 
         # Add tag filtering if tags are provided
         if tags:
-            # Filter tools that have any of the specified tags
-            tag_conditions = []
-            for tag in tags:
-                tag_conditions.append(func.json_contains(DbTool.tags, f'"{tag}"'))
-            if tag_conditions:
-                query = query.where(func.or_(*tag_conditions))
+            query = query.where(json_contains_expr(db, DbTool.tags, tags, match_any=True))
 
         tools = db.execute(query).scalars().all()
         return [self._convert_tool_to_read(t) for t in tools]
@@ -512,6 +571,74 @@ class ToolService:
         logger.debug(f"Listing server tools for server_id={server_id} with include_inactive={include_inactive}, cursor={cursor}")
         if not include_inactive:
             query = query.where(DbTool.enabled)
+        tools = db.execute(query).scalars().all()
+        return [self._convert_tool_to_read(t) for t in tools]
+
+    async def list_tools_for_user(
+        self, db: Session, user_email: str, team_id: Optional[str] = None, visibility: Optional[str] = None, include_inactive: bool = False, skip: int = 0, limit: int = 100
+    ) -> List[ToolRead]:
+        """
+        List tools user has access to with team filtering.
+
+        Args:
+            db: Database session
+            user_email: Email of the user requesting tools
+            team_id: Optional team ID to filter by specific team
+            visibility: Optional visibility filter (private, team, public)
+            include_inactive: Whether to include inactive tools
+            skip: Number of tools to skip for pagination
+            limit: Maximum number of tools to return
+
+        Returns:
+            List[ToolRead]: Tools the user has access to
+        """
+        # Build query following existing patterns from list_tools()
+        team_service = TeamManagementService(db)
+        user_teams = await team_service.get_user_teams(user_email)
+        team_ids = [team.id for team in user_teams]
+
+        query = select(DbTool)
+
+        # Apply active/inactive filter
+        if not include_inactive:
+            query = query.where(DbTool.enabled.is_(True))
+
+        if team_id:
+            if team_id not in team_ids:
+                return []  # No access to team
+
+            access_conditions = []
+            # Filter by specific team
+            access_conditions.append(and_(DbTool.team_id == team_id, DbTool.visibility.in_(["team", "public"])))
+
+            access_conditions.append(and_(DbTool.team_id == team_id, DbTool.owner_email == user_email))
+
+            query = query.where(or_(*access_conditions))
+        else:
+            # Get user's accessible teams
+            # Build access conditions following existing patterns
+
+            access_conditions = []
+
+            # 1. User's personal resources (owner_email matches)
+            access_conditions.append(DbTool.owner_email == user_email)
+
+            # 2. Team resources where user is member
+            if team_ids:
+                access_conditions.append(and_(DbTool.team_id.in_(team_ids), DbTool.visibility.in_(["team", "public"])))
+
+            # 3. Public resources (if visibility allows)
+            access_conditions.append(DbTool.visibility == "public")
+
+            query = query.where(or_(*access_conditions))
+
+        # Apply visibility filter if specified
+        if visibility:
+            query = query.where(DbTool.visibility == visibility)
+
+        # Apply pagination following existing patterns
+        query = query.offset(skip).limit(limit)
+
         tools = db.execute(query).scalars().all()
         return [self._convert_tool_to_read(t) for t in tools]
 
@@ -992,6 +1119,7 @@ class ToolService:
         Raises:
             ToolNotFoundError: If the tool is not found.
             IntegrityError: If there is a database integrity error.
+            ToolNameConflictError: If a tool with the same name already exists.
             ToolError: For other update errors.
 
         Examples:
@@ -1016,8 +1144,27 @@ class ToolService:
             tool = db.get(DbTool, tool_id)
             if not tool:
                 raise ToolNotFoundError(f"Tool not found: {tool_id}")
+
+            # Check for name change and ensure uniqueness
+            if tool_update.name and tool_update.name != tool.name:
+                # Check for existing tool with the same name and visibility
+                if tool_update.visibility.lower() == "public":
+                    # Check for existing public tool with the same name
+                    existing_tool = db.execute(select(DbTool).where(DbTool.custom_name == tool_update.custom_name, DbTool.visibility == "public")).scalar_one_or_none()
+                    if existing_tool:
+                        raise ToolNameConflictError(existing_tool.custom_name, enabled=existing_tool.enabled, tool_id=existing_tool.id, visibility=existing_tool.visibility)
+                elif tool_update.visibility.lower() == "team" and tool_update.team_id:
+                    # Check for existing team tool with the same name
+                    existing_tool = db.execute(
+                        select(DbTool).where(DbTool.custom_name == tool_update.custom_name, DbTool.visibility == "team", DbTool.team_id == tool_update.team_id)
+                    ).scalar_one_or_none()
+                    if existing_tool:
+                        raise ToolNameConflictError(existing_tool.custom_name, enabled=existing_tool.enabled, tool_id=existing_tool.id, visibility=existing_tool.visibility)
+
             if tool_update.custom_name is not None:
                 tool.custom_name = tool_update.custom_name
+            if tool_update.displayName is not None:
+                tool.display_name = tool_update.displayName
             if tool_update.url is not None:
                 tool.url = str(tool_update.url)
             if tool_update.description is not None:
@@ -1034,6 +1181,8 @@ class ToolService:
                 tool.annotations = tool_update.annotations
             if tool_update.jsonpath_filter is not None:
                 tool.jsonpath_filter = tool_update.jsonpath_filter
+            if tool_update.visibility is not None:
+                tool.visibility = tool_update.visibility
 
             if tool_update.auth is not None:
                 if tool_update.auth.auth_type is not None:
@@ -1075,6 +1224,9 @@ class ToolService:
         except ToolNotFoundError as tnfe:
             logger.error(f"Tool not found during update: {tnfe}")
             raise tnfe
+        except ToolNameConflictError as tnce:
+            logger.error(f"Tool name conflict during update: {tnce}")
+            raise tnce
         except Exception as ex:
             db.rollback()
             raise ToolError(f"Failed to update tool: {str(ex)}")
@@ -1344,6 +1496,7 @@ class ToolService:
         # Create tool entry for the A2A agent
         tool_data = ToolCreate(
             name=tool_name,
+            displayName=generate_display_name(agent.name),
             url=agent.endpoint_url,
             description=f"A2A Agent: {agent.description or agent.name}",
             integration_type="A2A",  # Special integration type for A2A agents

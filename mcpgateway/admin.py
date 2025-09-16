@@ -116,6 +116,23 @@ if logging_service is None:
     logging_service = LoggingService()
     logger = logging_service.get_logger("mcpgateway.admin")
 
+
+def extract_user_email(user: Union[str, Dict[str, Any]]) -> str:
+    """Extract user email from authentication result.
+    
+    Args:
+        user: Result from require_auth, either email string or user dict
+        
+    Returns:
+        str: User email address or 'anonymous' for unauthenticated users
+    """
+    if isinstance(user, str):
+        return user  # Already an email or 'anonymous'
+    else:
+        # JWT payload typically has 'sub' (subject) or 'email' field
+        return user.get('email') or user.get('sub') or 'anonymous'
+
+
 # Initialize services
 server_service: ServerService = ServerService()
 tool_service: ToolService = ToolService()
@@ -210,7 +227,7 @@ admin_router = APIRouter(prefix="/admin", tags=["Admin UI"])
 @rate_limit(requests_per_minute=30)  # Lower limit for config endpoints
 async def get_global_passthrough_headers(
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: Union[str, Dict[str, Any]] = Depends(require_auth),
 ) -> GlobalConfigRead:
     """Get the global passthrough headers configuration.
 
@@ -245,7 +262,7 @@ async def update_global_passthrough_headers(
     request: Request,  # pylint: disable=unused-argument
     config_update: GlobalConfigUpdate,
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: Union[str, Dict[str, Any]] = Depends(require_auth),
 ) -> GlobalConfigRead:
     """Update the global passthrough headers configuration.
 
@@ -622,6 +639,7 @@ async def admin_add_server(request: Request, db: Session = Depends(get_db), user
     try:
         if logger: logger.debug(f"User {user} is adding a new server with name: {form['name']}")
         server = ServerCreate(
+            id=None,
             name=str(form.get("name") or ""),
             description=str(form.get("description") or "") if form.get("description") else None,
             icon=str(form.get("icon") or "") if form.get("icon") else None,
@@ -630,6 +648,8 @@ async def admin_add_server(request: Request, db: Session = Depends(get_db), user
             associated_prompts=str(form.get("associatedPrompts") or "").split(",") if form.get("associatedPrompts") else None,
             associated_a2a_agents=str(form.get("associatedA2AAgents") or "").split(",") if form.get("associatedA2AAgents") else None,
             tags=tags,
+            team_id=None,
+            owner_email=None,
         )
     except KeyError as e:
         # Convert KeyError to ValidationError-like response
@@ -777,6 +797,7 @@ async def admin_edit_server(
     try:
         if logger: logger.debug(f"User {user} is editing server ID {server_id} with name: {form.get('name')}")
         server = ServerUpdate(
+            id=None,
             name=str(form.get("name") or "") if form.get("name") else None,
             description=str(form.get("description") or "") if form.get("description") else None,
             icon=str(form.get("icon") or "") if form.get("icon") else None,
@@ -785,8 +806,12 @@ async def admin_edit_server(
             associated_prompts=str(form.get("associatedPrompts") or "").split(",") if form.get("associatedPrompts") else None,
             associated_a2a_agents=str(form.get("associatedA2AAgents") or "").split(",") if form.get("associatedA2AAgents") else None,
             tags=tags,
+            team_id=None,
+            owner_email=None,
+            visibility=None,
         )
-        await server_service.update_server(db, server_id, server)
+        user_email = extract_user_email(user)
+        await server_service.update_server(db, server_id, server, user_email)
 
         return JSONResponse(
             content={"message": "Server updated successfully!", "success": True},
@@ -1596,6 +1621,7 @@ async def admin_ui(
             "gateway_tool_name_separator": settings.gateway_tool_name_separator,
             "bulk_import_max_tools": settings.mcpgateway_bulk_import_max_tools,
             "a2a_enabled": settings.mcpgateway_a2a_enabled,
+            "mcpgateway_ui_tool_test_timeout": settings.mcpgateway_ui_tool_test_timeout,
         },
     )
 
@@ -2724,6 +2750,8 @@ async def admin_add_gateway(request: Request, db: Session = Depends(get_db), use
             auth_headers=auth_headers if auth_headers else None,
             oauth_config=oauth_config,
             passthrough_headers=passthrough_headers,
+            team_id=None,
+            owner_email=None,
         )
     except KeyError as e:
         # Convert KeyError to ValidationError-like response
@@ -2944,6 +2972,9 @@ async def admin_edit_gateway(
             auth_headers=auth_headers if auth_headers else None,
             passthrough_headers=passthrough_headers,
             oauth_config=oauth_config,
+            team_id=None,
+            owner_email=None,
+            visibility=None,
         )
         await gateway_service.update_gateway(db, gateway_id, gateway)
         return JSONResponse(
@@ -3214,6 +3245,8 @@ async def admin_add_resource(request: Request, db: Session = Depends(get_db), us
             template=cast(str | None, form.get("template")),
             content=str(form["content"]),
             tags=tags,
+            team_id=None,
+            owner_email=None,
         )
 
         metadata = MetadataCapture.extract_creation_metadata(request, user)
@@ -3351,6 +3384,9 @@ async def admin_edit_resource(
             content=str(form["content"]),
             template=str(form.get("template")),
             tags=tags,
+            team_id=None,
+            owner_email=None,
+            visibility=None,
         )
         await resource_service.update_resource(db, uri, resource)
         return JSONResponse(
@@ -3713,6 +3749,8 @@ async def admin_add_prompt(request: Request, db: Session = Depends(get_db), user
             template=str(form["template"]),
             arguments=arguments,
             tags=tags,
+            team_id=None,
+            owner_email=None,
         )
         # Extract creation metadata
         metadata = MetadataCapture.extract_creation_metadata(request, user)
@@ -3830,6 +3868,9 @@ async def admin_edit_prompt(
             template=str(form["template"]),
             arguments=arguments,
             tags=tags,
+            team_id=None,
+            owner_email=None,
+            visibility=None,
         )
         await prompt_service.update_prompt(db, name, prompt)
 
@@ -4194,7 +4235,7 @@ from mcpgateway.utils.metrics_common import format_response_time
 @admin_router.get("/metrics")
 async def get_aggregated_metrics(
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: Union[str, Dict[str, Any]] = Depends(require_auth),
 ) -> Dict[str, Any]:
     """Retrieve aggregated metrics and top performers for all entity types.
 
