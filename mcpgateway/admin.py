@@ -158,7 +158,7 @@ def rate_limit(requests_per_minute: Optional[int] = None) -> Callable[..., Any]:
         requests_per_minute: Maximum requests per minute (uses config default if None)
 
     Returns:
-        Decorator function that enforces rate limiting
+        Decorator function that enforces per-IP request limits
     """
 
     def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
