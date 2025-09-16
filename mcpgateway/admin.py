@@ -2243,6 +2243,7 @@ async def admin_edit_tool(
     tags_str = str(form.get("tags", ""))
     tags: list[str] = [tag.strip() for tag in tags_str.split(",") if tag.strip()] if tags_str else []
 
+# Assemble snake_case keys expected by Pydantic schemas from form inputs
     tool_data: dict[str, Any] = {
         "name": form.get("name"),
         "custom_name": form.get("customName"),
