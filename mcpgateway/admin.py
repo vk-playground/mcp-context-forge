@@ -2024,7 +2024,7 @@ async def admin_add_tool(
     }
     if logger: logger.debug(f"Tool data built: {tool_data}")
     try:
-        tool = ToolCreate(**tool_data)
+        tool = ToolCreate(**tool_data) # Pydantic validation happens here; raises ValidationError on bad input
         if logger: logger.debug(f"Validated tool data: {tool.model_dump(by_alias=True)}")
 
         # Extract creation metadata
