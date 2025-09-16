@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 Integration tests for metrics export endpoints.
+This test ensures the /admin/metrics/export endpoint produces valid CSV output
+
 """
 
 # Standard
