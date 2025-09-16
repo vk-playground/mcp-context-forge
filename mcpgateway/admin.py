@@ -1992,6 +1992,7 @@ async def admin_add_tool(
     integration_type = form.get("integrationType", "REST")
     request_type = form.get("requestType")
 
+    # Map UI fields to internal defaults if missing (REST -> GET, MCP -> SSE)
     if request_type is None:
         if integration_type == "REST":
             request_type = "GET"  # or any valid REST method default
