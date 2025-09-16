@@ -2567,7 +2567,7 @@ class GatewayService:  # pylint: disable=too-many-instance-attributes
         )
         db.add(metric)
         db.commit()
-        try:  # pragma: no cover
+        try:  
             db.expire(server, ["metrics"])
-        except Exception:  # noqa: BLE001
+        except Exception:  
             pass
