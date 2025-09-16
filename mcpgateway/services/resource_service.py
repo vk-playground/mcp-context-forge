@@ -152,11 +152,10 @@ class ResourceService:
         logger.info("Resource service shutdown complete")
 
     async def get_top_resources(self, db: Session, limit: Optional[int] = 5) -> List[TopPerformer]:
-        """Retrieve the top-performing resources based on execution count.
+        """Retrieve top-performing resources by execution count.
 
-        Queries the database to get resources with their metrics, ordered by the number of executions
-        in descending order. Uses the resource URI as the name field for TopPerformer objects.
-        Returns a list of TopPerformer objects containing resource details and performance metrics.
+        Aggregates resource metrics (execution count, average response time, success rate, last execution)
+        ordered by execution count descending. Returns TopPerformer objects, using resource URI as the name.
 
         Args:
             db (Session): Database session for querying resource metrics.
