@@ -1550,11 +1550,19 @@ async def admin_ui(
         ...     customName="T1",
         ...     tags=[]
         ... )
+
         >>> server_service.list_servers = AsyncMock(return_value=[mock_server])
         >>> tool_service.list_tools = AsyncMock(return_value=[mock_tool])
         >>>
         >>> async def test_admin_ui_with_data():
         ...     response = await admin_ui(mock_request, False, mock_db, mock_user, mock_jwt)
+
+        >>> server_service.list_servers_for_user = AsyncMock(return_value=[mock_server])
+        >>> tool_service.list_tools_for_user = AsyncMock(return_value=[mock_tool])
+        >>>
+        >>> async def test_admin_ui_with_data():
+        ...     response = await admin_ui(mock_request, None, False, mock_db, mock_user)
+
         ...     # Check if template context was populated (indirectly via mock calls)
         ...     assert mock_request.app.state.templates.TemplateResponse.call_count >= 1
         ...     context = mock_request.app.state.templates.TemplateResponse.call_args[0][2]
@@ -1563,6 +1571,7 @@ async def admin_ui(
         >>> asyncio.run(test_admin_ui_with_data())
         True
         >>>
+
         >>> # Test exception handling during data fetching
         >>> server_service.list_servers = AsyncMock(side_effect=Exception("DB error"))
         >>> async def test_admin_ui_exception_handled():
@@ -1571,6 +1580,28 @@ async def admin_ui(
         ...         return False  # Should not reach here if exception is properly raised
         ...     except Exception as e:
         ...         return str(e) == "DB error"
+
+        >>> from unittest.mock import AsyncMock, patch
+        >>> import logging
+        >>>
+        >>> server_service.list_servers_for_user = AsyncMock(side_effect=Exception("DB error"))
+        >>>
+        >>> async def test_admin_ui_exception_handled():
+        ...     with patch("mcpgateway.admin.LOGGER.exception") as mock_log:
+        ...         response = await admin_ui(
+        ...             request=mock_request,
+        ...             team_id=None,
+        ...             include_inactive=False,
+        ...             db=mock_db,
+        ...             user=mock_user
+        ...         )
+        ...         # Check that the response rendered correctly
+        ...         ok_response = isinstance(response, HTMLResponse) and response.status_code == 200
+        ...         # Check that the exception was logged
+        ...         log_called = mock_log.called
+        ...         # Optionally, you can even inspect the message if you want
+        ...         return ok_response and log_called
+
         >>>
         >>> asyncio.run(test_admin_ui_exception_handled())
         True
@@ -1582,6 +1613,2593 @@ async def admin_ui(
         >>> prompt_service.list_prompts = original_list_prompts
         >>> gateway_service.list_gateways = original_list_gateways
         >>> root_service.list_roots = original_list_roots
+        >>> server_service.list_servers_for_user = original_list_servers_for_user
+        >>> tool_service.list_tools_for_user = original_list_tools_for_user
+        >>> resource_service.list_resources_for_user = original_list_resources_for_user
+        >>> prompt_service.list_prompts_for_user = original_list_prompts_for_user
+        >>> gateway_service.list_gateways = original_list_gateways
+        >>> root_service.list_roots = original_list_roots
+    """
+    LOGGER.debug(f"User {get_user_email(user)} accessed the admin UI (team_id={team_id})")
+    user_email = get_user_email(user)
+
+    # --------------------------------------------------------------------------------
+    # Load user teams so we can validate team_id
+    # --------------------------------------------------------------------------------
+    user_teams = []
+    team_service = None
+    if getattr(settings, "email_auth_enabled", False):
+        try:
+            team_service = TeamManagementService(db)
+            if user_email and "@" in user_email:
+                raw_teams = await team_service.get_user_teams(user_email)
+                user_teams = []
+                for team in raw_teams:
+                    try:
+                        team_dict = {
+                            "id": str(team.id) if team.id else "",
+                            "name": str(team.name) if team.name else "",
+                            "type": str(getattr(team, "type", "organization")),
+                            "is_personal": bool(getattr(team, "is_personal", False)),
+                            "member_count": team.get_member_count() if hasattr(team, "get_member_count") else 0,
+                        }
+                        user_teams.append(team_dict)
+                    except Exception as team_error:
+                        LOGGER.warning(f"Failed to serialize team {getattr(team, 'id', 'unknown')}: {team_error}")
+                        continue
+        except Exception as e:
+            LOGGER.warning(f"Failed to load user teams: {e}")
+            user_teams = []
+
+    # --------------------------------------------------------------------------------
+    # Validate team_id if provided (only when email-based teams are enabled)
+    # If invalid, we currently *ignore* it and fall back to default behavior.
+    # Optionally you can raise HTTPException(403) if you prefer strict rejection.
+    # --------------------------------------------------------------------------------
+    selected_team_id = team_id
+    if team_id and getattr(settings, "email_auth_enabled", False):
+        # If team list failed to load for some reason, be conservative and drop selection
+        if not user_teams:
+            LOGGER.warning("team_id requested but user_teams not available; ignoring team filter")
+            selected_team_id = None
+        else:
+            valid_team_ids = {t["id"] for t in user_teams if t.get("id")}
+            if str(team_id) not in valid_team_ids:
+                LOGGER.warning("Requested team_id is not in user's teams; ignoring team filter (team_id=%s)", team_id)
+                selected_team_id = None
+
+    # --------------------------------------------------------------------------------
+    # Helper: attempt to call a listing function with team_id if it supports it.
+    # If the method signature doesn't accept team_id, fall back to calling it without
+    # and then (optionally) filter the returned results.
+    # --------------------------------------------------------------------------------
+    async def _call_list_with_team_support(method, *args, **kwargs):
+        """
+        Attempt to call a method with an optional `team_id` parameter.
+
+        This function tries to call the given asynchronous `method` with all provided
+        arguments and an additional `team_id=selected_team_id`, assuming `selected_team_id`
+        is defined and not None. If the method does not accept a `team_id` keyword argument
+        (raises TypeError), the function retries the call without it.
+
+        This is useful in scenarios where some service methods optionally support team
+        scoping via a `team_id` parameter, but not all do.
+
+        Args:
+            method (Callable): The async function to be called.
+            *args: Positional arguments to pass to the method.
+            **kwargs: Keyword arguments to pass to the method.
+
+        Returns:
+            Any: The result of the awaited method call, typically a list of model instances.
+
+        Raises:
+            Any exception raised by the method itself, except TypeError when `team_id` is unsupported.
+
+
+        Doctest:
+            >>> async def sample_method(a, b):
+            ...     return [a, b]
+            >>> async def sample_method_with_team(a, b, team_id=None):
+            ...     return [a, b, team_id]
+            >>> selected_team_id = 42
+            >>> import asyncio
+            >>> asyncio.run(_call_list_with_team_support(sample_method_with_team, 1, 2))
+            [1, 2, 42]
+            >>> asyncio.run(_call_list_with_team_support(sample_method, 1, 2))
+            [1, 2]
+
+        Notes:
+            - This function depends on a global `selected_team_id` variable.
+            - If `selected_team_id` is None, the method is called without `team_id`.
+        """
+        if selected_team_id is None:
+            return await method(*args, **kwargs)
+
+        try:
+            # Preferred: pass team_id to the service method if it accepts it
+            return await method(*args, team_id=selected_team_id, **kwargs)
+        except TypeError:
+            # The method doesn't accept team_id -> fall back to original API
+            LOGGER.debug("Service method %s does not accept team_id; falling back and will post-filter", getattr(method, "__name__", str(method)))
+            return await method(*args, **kwargs)
+
+    # Small utility to check if a returned model or dict matches the selected_team_id.
+    def _matches_selected_team(item, tid: str) -> bool:
+        """
+        Determine whether the given item is associated with the specified team ID.
+
+        This function attempts to determine if the input `item` (which may be a Pydantic model,
+        an object with attributes, or a dictionary) is associated with the given team ID (`tid`).
+        It checks several common attribute names (e.g., `team_id`, `team_ids`, `teams`) to see
+        if any of them match the provided team ID. These fields may contain either a single ID
+        or a list of IDs.
+
+        If `tid` is falsy (e.g., empty string), the function returns True.
+
+        Args:
+            item: An object or dictionary that may contain team identification fields.
+            tid (str): The team ID to match.
+
+        Returns:
+            bool: True if the item is associated with the specified team ID, otherwise False.
+
+        Examples:
+            >>> class Obj:
+            ...     team_id = 'abc123'
+            >>> _matches_selected_team(Obj(), 'abc123')
+            True
+
+            >>> class Obj:
+            ...     team_ids = ['abc123', 'def456']
+            >>> _matches_selected_team(Obj(), 'def456')
+            True
+
+            >>> _matches_selected_team({'teamId': 'xyz789'}, 'xyz789')
+            True
+
+            >>> _matches_selected_team({'teamIds': ['123', '456']}, '789')
+            False
+
+            >>> _matches_selected_team({'teams': ['t1', 't2']}, 't1')
+            True
+
+            >>> _matches_selected_team({}, '')
+            True
+
+            >>> _matches_selected_team(None, 'abc')
+            False
+        """
+        if not tid:
+            return True
+        # item may be a pydantic model or dict-like
+        # check common fields for team membership
+        candidates = []
+        try:
+            # If it's an object with attributes
+            candidates.extend(
+                [
+                    getattr(item, "team_id", None),
+                    getattr(item, "teamId", None),
+                    getattr(item, "team_ids", None),
+                    getattr(item, "teamIds", None),
+                    getattr(item, "teams", None),
+                ]
+            )
+        except Exception:
+            pass  # nosec B110 - Intentionally ignore errors when extracting team IDs from objects
+        try:
+            # If it's a dict-like model_dump output (we'll check keys later after model_dump)
+            if isinstance(item, dict):
+                candidates.extend(
+                    [
+                        item.get("team_id"),
+                        item.get("teamId"),
+                        item.get("team_ids"),
+                        item.get("teamIds"),
+                        item.get("teams"),
+                    ]
+                )
+        except Exception:
+            pass  # nosec B110 - Intentionally ignore errors when extracting team IDs from dict objects
+
+        for c in candidates:
+            if c is None:
+                continue
+            # Some fields may be single id or list of ids
+            if isinstance(c, (list, tuple, set)):
+                if str(tid) in [str(x) for x in c]:
+                    return True
+            else:
+                if str(c) == str(tid):
+                    return True
+        return False
+
+    # --------------------------------------------------------------------------------
+    # Load each resource list using the safe _call_list_with_team_support helper.
+    # For each returned list, try to produce consistent "model_dump(by_alias=True)" dicts,
+    # applying server-side filtering as a fallback if the service didn't accept team_id.
+    # --------------------------------------------------------------------------------
+    try:
+        raw_tools = await _call_list_with_team_support(tool_service.list_tools_for_user, db, user_email, include_inactive=include_inactive)
+    except Exception as e:
+        LOGGER.exception("Failed to load tools for user: %s", e)
+        raw_tools = []
+
+    try:
+        raw_servers = await _call_list_with_team_support(server_service.list_servers_for_user, db, user_email, include_inactive=include_inactive)
+    except Exception as e:
+        LOGGER.exception("Failed to load servers for user: %s", e)
+        raw_servers = []
+
+    try:
+        raw_resources = await _call_list_with_team_support(resource_service.list_resources_for_user, db, user_email, include_inactive=include_inactive)
+    except Exception as e:
+        LOGGER.exception("Failed to load resources for user: %s", e)
+        raw_resources = []
+
+    try:
+        raw_prompts = await _call_list_with_team_support(prompt_service.list_prompts_for_user, db, user_email, include_inactive=include_inactive)
+    except Exception as e:
+        LOGGER.exception("Failed to load prompts for user: %s", e)
+        raw_prompts = []
+
+    try:
+        gateways_raw = await _call_list_with_team_support(gateway_service.list_gateways_for_user, db, user_email, include_inactive=include_inactive)
+    except Exception as e:
+        LOGGER.exception("Failed to load gateways: %s", e)
+        gateways_raw = []
+
+    # Convert models to dicts and filter as needed
+    def _to_dict_and_filter(raw_list):
+        """
+        Convert a list of items (Pydantic models, dicts, or similar) to dictionaries and filter them
+        based on a globally defined `selected_team_id`.
+
+        For each item:
+        - Try to convert it to a dictionary via `.model_dump(by_alias=True)` (if it's a Pydantic model),
+        or keep it as-is if it's already a dictionary.
+        - If the conversion fails, try to coerce the item to a dictionary via `dict(item)`.
+        - If `selected_team_id` is set, include only items that match it via `_matches_selected_team`.
+
+        Args:
+            raw_list (list): A list of Pydantic models, dictionaries, or similar objects.
+
+        Returns:
+            list: A filtered list of dictionaries.
+
+        Examples:
+            >>> global selected_team_id
+            >>> selected_team_id = 'team123'
+            >>> class Model:
+            ...     def __init__(self, team_id): self.team_id = team_id
+            ...     def model_dump(self, by_alias=False): return {'team_id': self.team_id}
+            >>> items = [Model('team123'), Model('team999')]
+            >>> _to_dict_and_filter(items)
+            [{'team_id': 'team123'}]
+
+            >>> selected_team_id = None
+            >>> _to_dict_and_filter([{'team_id': 'any_team'}])
+            [{'team_id': 'any_team'}]
+
+            >>> selected_team_id = 't1'
+            >>> _to_dict_and_filter([{'team_ids': ['t1', 't2']}, {'team_ids': ['t3']}])
+            [{'team_ids': ['t1', 't2']}]
+        """
+        out = []
+        for item in raw_list or []:
+            try:
+                dumped = item.model_dump(by_alias=True) if hasattr(item, "model_dump") else (item if isinstance(item, dict) else None)
+            except Exception:
+                # if dumping failed, try to coerce to dict
+                try:
+                    dumped = dict(item) if hasattr(item, "__iter__") else None
+                except Exception:
+                    dumped = None
+            if dumped is None:
+                continue
+
+            # If we passed team_id to service, server-side filtering applied.
+            # Otherwise, filter by common team-aware fields if selected_team_id is set.
+            if selected_team_id:
+                if _matches_selected_team(item, selected_team_id) or _matches_selected_team(dumped, selected_team_id):
+                    out.append(dumped)
+                else:
+                    # skip items that don't match the selected team
+                    continue
+            else:
+                out.append(dumped)
+        return out
+
+    tools = list(sorted(_to_dict_and_filter(raw_tools), key=lambda t: ((t.get("url") or "").lower(), (t.get("original_name") or "").lower())))
+    servers = _to_dict_and_filter(raw_servers)
+    resources = _to_dict_and_filter(raw_resources)  # pylint: disable=unnecessary-comprehension
+    prompts = _to_dict_and_filter(raw_prompts)
+    gateways = [g.model_dump(by_alias=True) if hasattr(g, "model_dump") else (g if isinstance(g, dict) else {}) for g in (gateways_raw or [])]
+    # If gateways need team filtering as dicts too, apply _to_dict_and_filter similarly:
+    gateways = _to_dict_and_filter(gateways_raw) if isinstance(gateways_raw, (list, tuple)) else gateways
+
+    # roots
+    roots = [root.model_dump(by_alias=True) for root in await root_service.list_roots()]
+
+    # Load A2A agents if enabled
+    a2a_agents = []
+    if a2a_service and settings.mcpgateway_a2a_enabled:
+        a2a_agents_raw = await a2a_service.list_agents(db, include_inactive=include_inactive)
+        a2a_agents = [agent.model_dump(by_alias=True) for agent in a2a_agents_raw]
+
+    # Template variables and context: include selected_team_id so the template and frontend can read it
+    root_path = settings.app_root_path
+    max_name_length = settings.validation_max_name_length
+
+    response = request.app.state.templates.TemplateResponse(
+        request,
+        "admin.html",
+        {
+            "request": request,
+            "servers": servers,
+            "tools": tools,
+            "resources": resources,
+            "prompts": prompts,
+            "gateways": gateways,
+            "a2a_agents": a2a_agents,
+            "roots": roots,
+            "include_inactive": include_inactive,
+            "root_path": root_path,
+            "max_name_length": max_name_length,
+            "gateway_tool_name_separator": settings.gateway_tool_name_separator,
+            "bulk_import_max_tools": settings.mcpgateway_bulk_import_max_tools,
+            "a2a_enabled": settings.mcpgateway_a2a_enabled,
+            "current_user": get_user_email(user),
+            "email_auth_enabled": getattr(settings, "email_auth_enabled", False),
+            "is_admin": bool(user.get("is_admin") if isinstance(user, dict) else False),
+            "user_teams": user_teams,
+            "mcpgateway_ui_tool_test_timeout": settings.mcpgateway_ui_tool_test_timeout,
+            "selected_team_id": selected_team_id,
+        },
+    )
+
+    # Set JWT token cookie for HTMX requests if email auth is enabled
+    if getattr(settings, "email_auth_enabled", False):
+        try:
+            # JWT library is imported at top level as jwt
+
+            # Determine the admin user email
+            admin_email = get_user_email(user)
+            is_admin_flag = bool(user.get("is_admin") if isinstance(user, dict) else True)
+
+            # Generate a comprehensive JWT token that matches the email auth format
+            now = datetime.now(timezone.utc)
+            payload = {
+                "sub": admin_email,
+                "iss": settings.jwt_issuer,
+                "aud": settings.jwt_audience,
+                "iat": int(now.timestamp()),
+                "exp": int((now + timedelta(minutes=settings.token_expiry)).timestamp()),
+                "jti": str(uuid.uuid4()),
+                "user": {"email": admin_email, "full_name": getattr(settings, "platform_admin_full_name", "Platform User"), "is_admin": is_admin_flag, "auth_provider": "local"},
+                "teams": [],  # Teams populated downstream when needed
+                "namespaces": [f"user:{admin_email}", "public"],
+                "scopes": {"server_id": None, "permissions": ["*"], "ip_restrictions": [], "time_restrictions": {}},
+            }
+
+            # Generate token using centralized token creation
+            token = await create_jwt_token(payload)
+
+            # Set HTTP-only cookie for security
+            response.set_cookie(
+                key="jwt_token",
+                value=token,
+                httponly=True,
+                secure=getattr(settings, "secure_cookies", False),
+                samesite=getattr(settings, "cookie_samesite", "lax"),
+                max_age=settings.token_expiry * 60,  # Convert minutes to seconds
+                path="/",  # Make cookie available for all paths
+            )
+            LOGGER.debug(f"Set comprehensive JWT token cookie for user: {admin_email}")
+        except Exception as e:
+            LOGGER.warning(f"Failed to set JWT token cookie for user {user}: {e}")
+
+    return response
+
+
+@admin_router.get("/login")
+async def admin_login_page(request: Request) -> Response:
+    """
+    Render the admin login page.
+
+    This endpoint serves the login form for email-based authentication.
+    If email auth is disabled, redirects to the main admin page.
+
+    Args:
+        request (Request): FastAPI request object.
+
+    Returns:
+        Response: Rendered HTML or redirect response.
+
+    Examples:
+        >>> from fastapi import Request
+        >>> from fastapi.responses import HTMLResponse
+        >>> from unittest.mock import MagicMock
+        >>>
+        >>> # Mock request
+        >>> mock_request = MagicMock(spec=Request)
+        >>> mock_request.scope = {"root_path": "/test"}
+        >>> mock_request.app.state.templates = MagicMock()
+        >>> mock_response = HTMLResponse("<html>Login</html>")
+        >>> mock_request.app.state.templates.TemplateResponse.return_value = mock_response
+        >>>
+        >>> import asyncio
+        >>> async def test_login_page():
+        ...     response = await admin_login_page(mock_request)
+        ...     return isinstance(response, HTMLResponse)
+        >>>
+        >>> asyncio.run(test_login_page())
+        True
+    """
+    # Check if email auth is enabled
+    if not getattr(settings, "email_auth_enabled", False):
+        root_path = request.scope.get("root_path", "")
+        return RedirectResponse(url=f"{root_path}/admin", status_code=303)
+
+    root_path = settings.app_root_path
+
+    # Use external template file
+    return request.app.state.templates.TemplateResponse("login.html", {"request": request, "root_path": root_path})
+
+
+@admin_router.post("/login")
+async def admin_login_handler(request: Request, db: Session = Depends(get_db)) -> RedirectResponse:
+    """
+    Handle admin login form submission.
+
+    This endpoint processes the email/password login form, authenticates the user,
+    sets the JWT cookie, and redirects to the admin panel or back to login with error.
+
+    Args:
+        request (Request): FastAPI request object.
+        db (Session): Database session dependency.
+
+    Returns:
+        RedirectResponse: Redirect to admin panel on success or login page on failure.
+
+    Examples:
+        >>> from fastapi import Request
+        >>> from fastapi.responses import RedirectResponse
+        >>> from unittest.mock import MagicMock, AsyncMock
+        >>>
+        >>> # Mock request with form data
+        >>> mock_request = MagicMock(spec=Request)
+        >>> mock_request.scope = {"root_path": "/test"}
+        >>> mock_form = {"email": "admin@example.com", "password": "changeme"}
+        >>> mock_request.form = AsyncMock(return_value=mock_form)
+        >>>
+        >>> mock_db = MagicMock()
+        >>>
+        >>> import asyncio
+        >>> async def test_login_handler():
+        ...     try:
+        ...         response = await admin_login_handler(mock_request, mock_db)
+        ...         return isinstance(response, RedirectResponse)
+        ...     except Exception:
+        ...         return True  # Expected due to mocked dependencies
+        >>>
+        >>> asyncio.run(test_login_handler())
+        True
+    """
+    if not getattr(settings, "email_auth_enabled", False):
+        root_path = request.scope.get("root_path", "")
+        return RedirectResponse(url=f"{root_path}/admin", status_code=303)
+
+    try:
+        form = await request.form()
+        email_val = form.get("email")
+        password_val = form.get("password")
+        email = email_val if isinstance(email_val, str) else None
+        password = password_val if isinstance(password_val, str) else None
+
+        if not email or not password:
+            root_path = request.scope.get("root_path", "")
+            return RedirectResponse(url=f"{root_path}/admin/login?error=missing_fields", status_code=303)
+
+        # Authenticate using the email auth service
+        # First-Party
+        from mcpgateway.services.email_auth_service import EmailAuthService  # pylint: disable=import-outside-toplevel  # pylint: disable=import-outside-toplevel
+
+        auth_service = EmailAuthService(db)
+
+        try:
+            # Authenticate user
+            LOGGER.debug(f"Attempting authentication for {email}")
+            user = await auth_service.authenticate_user(email, password)
+            LOGGER.debug(f"Authentication result: {user}")
+
+            if not user:
+                LOGGER.warning(f"Authentication failed for {email} - user is None")
+                root_path = request.scope.get("root_path", "")
+                return RedirectResponse(url=f"{root_path}/admin/login?error=invalid_credentials", status_code=303)
+
+            # Create JWT token with proper audience and issuer claims
+            # First-Party
+            from mcpgateway.routers.email_auth import create_access_token  # pylint: disable=import-outside-toplevel
+
+            token, _ = await create_access_token(user)  # expires_seconds not needed here
+
+            # Create redirect response
+            root_path = request.scope.get("root_path", "")
+            response = RedirectResponse(url=f"{root_path}/admin", status_code=303)
+
+            # Set JWT token as secure cookie
+            # First-Party
+            from mcpgateway.utils.security_cookies import set_auth_cookie  # pylint: disable=import-outside-toplevel
+
+            set_auth_cookie(response, token, remember_me=False)
+
+            LOGGER.info(f"Admin user {email} logged in successfully")
+            return response
+
+        except Exception as e:
+            LOGGER.warning(f"Login failed for {email}: {e}")
+            root_path = request.scope.get("root_path", "")
+            return RedirectResponse(url=f"{root_path}/admin/login?error=invalid_credentials", status_code=303)
+
+    except Exception as e:
+        LOGGER.error(f"Login handler error: {e}")
+        root_path = request.scope.get("root_path", "")
+        return RedirectResponse(url=f"{root_path}/admin/login?error=server_error", status_code=303)
+
+
+@admin_router.post("/logout")
+async def admin_logout(request: Request) -> RedirectResponse:
+    """
+    Handle admin logout by clearing authentication cookies.
+
+    This endpoint clears the JWT authentication cookie and redirects
+    the user to a login page or back to the admin page (which will
+    trigger authentication).
+
+    Args:
+        request (Request): FastAPI request object.
+
+    Returns:
+        RedirectResponse: Redirect to admin page with cleared cookies.
+
+    Examples:
+        >>> from fastapi import Request
+        >>> from fastapi.responses import RedirectResponse
+        >>> from unittest.mock import MagicMock
+        >>>
+        >>> # Mock request
+        >>> mock_request = MagicMock(spec=Request)
+        >>> mock_request.scope = {"root_path": "/test"}
+        >>>
+        >>> import asyncio
+        >>> async def test_logout():
+        ...     response = await admin_logout(mock_request)
+        ...     return isinstance(response, RedirectResponse) and response.status_code == 303
+        >>>
+        >>> asyncio.run(test_logout())
+        True
+    """
+    LOGGER.info("Admin user logging out")
+    root_path = request.scope.get("root_path", "")
+
+    # Create redirect response to login page
+    response = RedirectResponse(url=f"{root_path}/admin/login", status_code=303)
+
+    # Clear JWT token cookie
+    response.delete_cookie("jwt_token", path="/", secure=True, httponly=True, samesite="lax")
+
+    return response
+
+
+# ============================================================================ #
+#                            TEAM ADMIN ROUTES                                #
+# ============================================================================ #
+
+
+async def _generate_unified_teams_view(team_service, current_user, root_path):  # pylint: disable=unused-argument
+    """Generate unified team view with relationship badges.
+
+    Args:
+        team_service: Service for team operations
+        current_user: Current authenticated user
+        root_path: Application root path
+
+    Returns:
+        HTML string containing the unified teams view
+    """
+    # Get user's teams (owned + member)
+    user_teams = await team_service.get_user_teams(current_user.email)
+
+    # Get public teams user can join
+    public_teams = await team_service.discover_public_teams(current_user.email)
+
+    # Combine teams with relationship information
+    all_teams = []
+
+    # Add user's teams (owned and member)
+    for team in user_teams:
+        user_role = await team_service.get_user_role_in_team(current_user.email, team.id)
+        relationship = "owner" if user_role == "owner" else "member"
+        all_teams.append({"team": team, "relationship": relationship, "member_count": team.get_member_count()})
+
+    # Add public teams user can join - check for pending requests
+    for team in public_teams:
+        # Check if user has a pending join request
+        user_requests = await team_service.get_user_join_requests(current_user.email, team.id)
+        pending_request = next((req for req in user_requests if req.status == "pending"), None)
+
+        relationship_data = {"team": team, "relationship": "join", "member_count": team.get_member_count(), "pending_request": pending_request}
+        all_teams.append(relationship_data)
+
+    # Generate HTML for unified team view
+    teams_html = ""
+    for item in all_teams:
+        team = item["team"]
+        relationship = item["relationship"]
+        member_count = item["member_count"]
+        pending_request = item.get("pending_request")
+
+        # Relationship badge - special handling for personal teams
+        if team.is_personal:
+            badge_html = '<span class="relationship-badge inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-300">PERSONAL</span>'
+        elif relationship == "owner":
+            badge_html = (
+                '<span class="relationship-badge inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-300">OWNER</span>'
+            )
+        elif relationship == "member":
+            badge_html = (
+                '<span class="relationship-badge inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-300">MEMBER</span>'
+            )
+        else:  # join
+            badge_html = '<span class="relationship-badge inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-orange-100 text-orange-800 dark:bg-orange-900 dark:text-orange-300">CAN JOIN</span>'
+
+        # Visibility badge
+        visibility_badge = (
+            f'<span class="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-gray-100 text-gray-800 dark:bg-gray-800 dark:text-gray-300">{team.visibility.upper()}</span>'
+        )
+
+        # Subtitle based on relationship - special handling for personal teams
+        if team.is_personal:
+            subtitle = "Your personal team • Private workspace"
+        elif relationship == "owner":
+            subtitle = "You own this team"
+        elif relationship == "member":
+            subtitle = f"You are a member • Owner: {team.created_by}"
+        else:  # join
+            subtitle = f"Public team • Owner: {team.created_by}"
+
+        # Escape team name for safe HTML attributes
+        safe_team_name = html.escape(team.name)
+
+        # Actions based on relationship - special handling for personal teams
+        actions_html = ""
+        if team.is_personal:
+            # Personal teams have no management actions - they're private workspaces
+            actions_html = """
+            <div class="flex flex-wrap gap-2 mt-3">
+                <span class="px-3 py-1 text-sm font-medium text-gray-500 dark:text-gray-400 bg-gray-100 dark:bg-gray-700 rounded-md">
+                    Personal workspace - no actions available
+                </span>
+            </div>
+            """
+        elif relationship == "owner":
+            delete_button = f'<button data-team-id="{team.id}" data-team-name="{safe_team_name}" onclick="deleteTeamSafe(this)" class="px-3 py-1 text-sm font-medium text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300 border border-red-300 dark:border-red-600 hover:border-red-500 dark:hover:border-red-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500">Delete Team</button>'
+            join_requests_button = (
+                f'<button data-team-id="{team.id}" onclick="viewJoinRequestsSafe(this)" class="px-3 py-1 text-sm font-medium text-purple-600 dark:text-purple-400 hover:text-purple-800 dark:hover:text-purple-300 border border-purple-300 dark:border-purple-600 hover:border-purple-500 dark:hover:border-purple-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-purple-500">Join Requests</button>'
+                if team.visibility == "public"
+                else ""
+            )
+            actions_html = f"""
+            <div class="flex flex-wrap gap-2 mt-3">
+                <button data-team-id="{team.id}" onclick="manageTeamMembersSafe(this)" class="px-3 py-1 text-sm font-medium text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 border border-blue-300 dark:border-blue-600 hover:border-blue-500 dark:hover:border-blue-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500">
+                    Manage Members
+                </button>
+                <button data-team-id="{team.id}" onclick="editTeamSafe(this)" class="px-3 py-1 text-sm font-medium text-green-600 dark:text-green-400 hover:text-green-800 dark:hover:text-green-300 border border-green-300 dark:border-green-600 hover:border-green-500 dark:hover:border-green-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-green-500">
+                    Edit Settings
+                </button>
+                {join_requests_button}
+                {delete_button}
+            </div>
+            """
+        elif relationship == "member":
+            leave_button = f'<button data-team-id="{team.id}" data-team-name="{safe_team_name}" onclick="leaveTeamSafe(this)" class="px-3 py-1 text-sm font-medium text-orange-600 dark:text-orange-400 hover:text-orange-800 dark:hover:text-orange-300 border border-orange-300 dark:border-orange-600 hover:border-orange-500 dark:hover:border-orange-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-orange-500">Leave Team</button>'
+            actions_html = f"""
+            <div class="flex flex-wrap gap-2 mt-3">
+                {leave_button}
+            </div>
+            """
+        else:  # join
+            if pending_request:
+                # Show "Requested to Join [Cancel Request]" state
+                actions_html = f"""
+                <div class="flex flex-wrap gap-2 mt-3">
+                    <span class="px-3 py-1 text-sm font-medium text-yellow-600 dark:text-yellow-400 bg-yellow-100 dark:bg-yellow-900 rounded-md border border-yellow-300 dark:border-yellow-600">
+                        ⏳ Requested to Join
+                    </span>
+                    <button onclick="cancelJoinRequest('{team.id}', '{pending_request.id}')" class="px-3 py-1 text-sm font-medium text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300 border border-red-300 dark:border-red-600 hover:border-red-500 dark:hover:border-red-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500">
+                        Cancel Request
+                    </button>
+                </div>
+                """
+            else:
+                # Show "Request to Join" button
+                actions_html = f"""
+                <div class="flex flex-wrap gap-2 mt-3">
+                    <button data-team-id="{team.id}" data-team-name="{safe_team_name}" onclick="requestToJoinTeamSafe(this)" class="px-3 py-1 text-sm font-medium text-indigo-600 dark:text-indigo-400 hover:text-indigo-800 dark:hover:text-indigo-300 border border-indigo-300 dark:border-indigo-600 hover:border-indigo-500 dark:hover:border-indigo-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500">
+                        Request to Join
+                    </button>
+                </div>
+                """
+
+        # Truncated description (properly escaped)
+        description_text = ""
+        if team.description:
+            safe_description = html.escape(team.description)
+            truncated = safe_description[:80] + "..." if len(safe_description) > 80 else safe_description
+            description_text = f'<p class="team-description text-sm text-gray-600 dark:text-gray-400 mt-1">{truncated}</p>'
+
+        teams_html += f"""
+        <div class="team-card bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-lg p-4 shadow-sm hover:shadow-md transition-shadow" data-relationship="{relationship}">
+            <div class="flex justify-between items-start mb-3">
+                <div class="flex-1">
+                    <div class="flex items-center gap-3 mb-2">
+                        <h4 class="team-name text-lg font-medium text-gray-900 dark:text-white">🏢 {safe_team_name}</h4>
+                        {badge_html}
+                        {visibility_badge}
+                        <span class="text-sm text-gray-500 dark:text-gray-400">{member_count} members</span>
+                    </div>
+                    <p class="text-sm text-gray-600 dark:text-gray-400">{subtitle}</p>
+                    {description_text}
+                </div>
+            </div>
+            {actions_html}
+        </div>
+        """
+
+    if not teams_html:
+        teams_html = '<div class="text-center py-12"><p class="text-gray-500 dark:text-gray-400">No teams found. Create your first team using the button above.</p></div>'
+
+    return HTMLResponse(content=teams_html)
+
+
+@admin_router.get("/teams")
+@require_permission("teams.read")
+async def admin_list_teams(
+    request: Request,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+    unified: bool = False,
+) -> HTMLResponse:
+    """List teams for admin UI via HTMX.
+
+    Args:
+        request: FastAPI request object
+        db: Database session
+        user: Authenticated admin user
+        unified: If True, return unified team view with relationship badges
+
+    Returns:
+        HTML response with teams list
+
+    Raises:
+        HTTPException: If email auth is disabled or user not found
+    """
+    if not getattr(settings, "email_auth_enabled", False):
+        return HTMLResponse(content='<div class="text-center py-8"><p class="text-gray-500">Email authentication is disabled. Teams feature requires email auth.</p></div>', status_code=200)
+
+    try:
+        # First-Party
+        from mcpgateway.services.email_auth_service import EmailAuthService  # pylint: disable=import-outside-toplevel
+
+        auth_service = EmailAuthService(db)
+        team_service = TeamManagementService(db)
+
+        # Get current user
+        user_email = get_user_email(user)
+        current_user = await auth_service.get_user_by_email(user_email)
+        if not current_user:
+            return HTMLResponse(content='<div class="text-center py-8"><p class="text-red-500">User not found</p></div>', status_code=200)
+
+        root_path = request.scope.get("root_path", "")
+
+        if unified:
+            # Generate unified team view
+            return await _generate_unified_teams_view(team_service, current_user, root_path)
+
+        # Generate traditional admin view
+        if current_user.is_admin:
+            teams, _ = await team_service.list_teams()
+        else:
+            teams = await team_service.get_user_teams(current_user.email)
+
+        # Generate HTML for teams (traditional view)
+        teams_html = ""
+        for team in teams:
+            member_count = team.get_member_count()
+            teams_html += f"""
+                <div id="team-card-{team.id}" class="border border-gray-200 dark:border-gray-600 rounded-lg p-4 mb-4">
+                    <div class="flex justify-between items-start">
+                        <div>
+                            <h4 class="text-lg font-medium text-gray-900 dark:text-white">{team.name}</h4>
+                            <p class="text-sm text-gray-600 dark:text-gray-400">Slug: {team.slug}</p>
+                            <p class="text-sm text-gray-600 dark:text-gray-400">Visibility: {team.visibility}</p>
+                            <p class="text-sm text-gray-600 dark:text-gray-400">Members: {member_count}</p>
+                            {f'<p class="text-sm text-gray-600 dark:text-gray-400">{team.description}</p>' if team.description else ""}
+                        </div>
+                        <div class="flex space-x-2">
+                            <button
+                                hx-get="{root_path}/admin/teams/{team.id}/members"
+                                hx-target="#team-details-{team.id}"
+                                hx-swap="innerHTML"
+                                class="px-3 py-1 text-sm font-medium text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 border border-blue-300 dark:border-blue-600 hover:border-blue-500 dark:hover:border-blue-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
+                            >
+                                View Members
+                            </button>
+                            <button
+                                onclick="showTeamEditModal('{team.id}')"
+                                class="px-3 py-1 text-sm font-medium text-green-600 dark:text-green-400 hover:text-green-800 dark:hover:text-green-300 border border-green-300 dark:border-green-600 hover:border-green-500 dark:hover:border-green-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-green-500"
+                            >
+                                Edit
+                            </button>
+                            {f'<button onclick="leaveTeam(&quot;{team.id}&quot;, &quot;{team.name}&quot;)" class="px-3 py-1 text-sm font-medium text-orange-600 dark:text-orange-400 hover:text-orange-800 dark:hover:text-orange-300 border border-orange-300 dark:border-orange-600 hover:border-orange-500 dark:hover:border-orange-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-orange-500">Leave Team</button>' if not team.is_personal and not current_user.is_admin else ""}
+                            {f'<button class="px-3 py-1 text-sm font-medium text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300 border border-red-300 dark:border-red-600 hover:border-red-500 dark:hover:border-red-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500" hx-delete="{root_path}/admin/teams/{team.id}" hx-confirm="Are you sure you want to delete this team?" hx-target="#team-card-{team.id}" hx-swap="outerHTML">Delete</button>' if not team.is_personal else ""}
+                        </div>
+                    </div>
+                    <div id="team-details-{team.id}" class="mt-4"></div>
+            </div>
+            """
+
+        if not teams_html:
+            teams_html = '<div class="text-center py-8"><p class="text-gray-500 dark:text-gray-400">No teams found. Create your first team above.</p></div>'
+
+        return HTMLResponse(content=teams_html)
+
+    except Exception as e:
+        LOGGER.error(f"Error listing teams for admin {user}: {e}")
+        return HTMLResponse(content=f'<div class="text-center py-8"><p class="text-red-500">Error loading teams: {str(e)}</p></div>', status_code=200)
+
+
+@admin_router.post("/teams")
+@require_permission("teams.create")
+async def admin_create_team(
+    request: Request,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> HTMLResponse:
+    """Create team via admin UI form submission.
+
+    Args:
+        request: FastAPI request object
+        db: Database session
+        user: Authenticated admin user
+
+    Returns:
+        HTML response with new team or error message
+
+    Raises:
+        HTTPException: If email auth is disabled or validation fails
+    """
+    if not getattr(settings, "email_auth_enabled", False):
+        return HTMLResponse(content='<div class="text-red-500">Email authentication is disabled</div>', status_code=403)
+
+    try:
+        # Get root path for URL construction
+        root_path = request.scope.get("root_path", "") if request else ""
+
+        form = await request.form()
+        name = form.get("name")
+        slug = form.get("slug") or None
+        description = form.get("description") or None
+        visibility = form.get("visibility", "private")
+
+        if not name:
+            return HTMLResponse(content='<div class="text-red-500">Team name is required</div>', status_code=400)
+
+        # Create team
+        # First-Party
+        from mcpgateway.schemas import TeamCreateRequest  # pylint: disable=import-outside-toplevel
+
+        team_service = TeamManagementService(db)
+
+        team_data = TeamCreateRequest(name=name, slug=slug, description=description, visibility=visibility)
+
+        # Extract user email from user dict
+        user_email = get_user_email(user)
+
+        team = await team_service.create_team(name=team_data.name, description=team_data.description, created_by=user_email, visibility=team_data.visibility)
+
+        # Return HTML for the new team
+        member_count = 1  # Creator is automatically a member
+        team_html = f"""
+        <div id="team-card-{team.id}" class="border border-gray-200 dark:border-gray-600 rounded-lg p-4 mb-4">
+            <div class="flex justify-between items-start">
+                <div>
+                    <h4 class="text-lg font-medium text-gray-900 dark:text-white">{team.name}</h4>
+                    <p class="text-sm text-gray-600 dark:text-gray-400">Slug: {team.slug}</p>
+                    <p class="text-sm text-gray-600 dark:text-gray-400">Visibility: {team.visibility}</p>
+                    <p class="text-sm text-gray-600 dark:text-gray-400">Members: {member_count}</p>
+                    {f'<p class="text-sm text-gray-600 dark:text-gray-400">{team.description}</p>' if team.description else ""}
+                </div>
+                <div class="flex space-x-2">
+                    <button
+                        hx-get="{root_path}/admin/teams/{team.id}/members"
+                        hx-target="#team-details-{team.id}"
+                        hx-swap="innerHTML"
+                        class="px-3 py-1 text-sm font-medium text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 border border-blue-300 dark:border-blue-600 hover:border-blue-500 dark:hover:border-blue-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
+                    >
+                        View Members
+                    </button>
+                    {'<button class="px-3 py-1 text-sm font-medium text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300 border border-red-300 dark:border-red-600 hover:border-red-500 dark:hover:border-red-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500" hx-delete="{root_path}/admin/teams/' + team.id + '" hx-confirm="Are you sure you want to delete this team?" hx-target="#team-card-' + team.id + '" hx-swap="outerHTML">Delete</button>' if not team.is_personal else ""}
+                </div>
+            </div>
+            <div id="team-details-{team.id}" class="mt-4"></div>
+        </div>
+        <script>
+            // Reset the team creation form after successful creation
+            setTimeout(() => {{
+                const form = document.querySelector('form[hx-post*="/admin/teams"]');
+                if (form) {{
+                    form.reset();
+                }}
+            }}, 500);
+        </script>
+        """
+
+        return HTMLResponse(content=team_html, status_code=201)
+
+    except IntegrityError as e:
+        LOGGER.error(f"Error creating team for admin {user}: {e}")
+        if "UNIQUE constraint failed: email_teams.slug" in str(e):
+            return HTMLResponse(content='<div class="text-red-500">A team with this name already exists. Please choose a different name.</div>', status_code=400)
+
+        return HTMLResponse(content=f'<div class="text-red-500">Database error creating team: {str(e)}</div>', status_code=400)
+    except Exception as e:
+        LOGGER.error(f"Error creating team for admin {user}: {e}")
+        return HTMLResponse(content=f'<div class="text-red-500">Error creating team: {str(e)}</div>', status_code=400)
+
+
+@admin_router.get("/teams/{team_id}/members")
+@require_permission("teams.read")
+async def admin_view_team_members(
+    team_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> HTMLResponse:
+    """View team members via admin UI.
+
+    Args:
+        team_id: ID of the team to view members for
+        request: FastAPI request object
+        db: Database session
+        user: Current authenticated user context
+
+    Returns:
+        HTMLResponse: Rendered team members view
+    """
+    if not settings.email_auth_enabled:
+        return HTMLResponse(content='<div class="text-red-500">Email authentication is disabled</div>', status_code=403)
+
+    try:
+        # Get root_path from request
+        root_path = request.scope.get("root_path", "")
+
+        # Get current user context for logging and authorization
+        user_email = get_user_email(user)
+        LOGGER.info(f"User {user_email} viewing members for team {team_id}")
+
+        # First-Party
+        from mcpgateway.services.email_auth_service import EmailAuthService  # pylint: disable=import-outside-toplevel  # pylint: disable=import-outside-toplevel
+
+        team_service = TeamManagementService(db)
+
+        # Get team details
+        team = await team_service.get_team_by_id(team_id)
+        if not team:
+            return HTMLResponse(content='<div class="text-red-500">Team not found</div>', status_code=404)
+
+        # Get team members
+        members = await team_service.get_team_members(team_id)
+
+        # Count owners to determine if this is the last owner
+        owner_count = sum(1 for _, membership in members if membership.role == "owner")
+
+        # Check if current user is team owner
+        current_user_role = await team_service.get_user_role_in_team(user_email, team_id)
+        is_team_owner = current_user_role == "owner"
+
+        # Build member table with inline role editing for team owners
+        members_html = """
+        <div class="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
+            <div class="px-6 py-4 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900">
+                <h4 class="text-sm font-semibold text-gray-900 dark:text-white">Team Members</h4>
+            </div>
+            <div class="divide-y divide-gray-200 dark:divide-gray-700">
+        """
+
+        for member_user, membership in members:
+            role_display = membership.role.replace("_", " ").title() if membership.role else "Member"
+            is_last_owner = membership.role == "owner" and owner_count == 1
+            is_current_user = member_user.email == user_email
+
+            # Role selection - only show for team owners and not for last owner
+            if is_team_owner and not is_last_owner:
+                role_selector = f"""
+                    <select
+                        name="role"
+                        class="text-xs px-2 py-1 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        hx-post="{root_path}/admin/teams/{team_id}/update-member-role"
+                        hx-vals='{{"user_email": "{member_user.email}"}}'
+                        hx-target="#team-edit-modal-content"
+                        hx-swap="innerHTML"
+                        hx-trigger="change">
+                        <option value="member" {"selected" if membership.role == "member" else ""}>Member</option>
+                        <option value="owner" {"selected" if membership.role == "owner" else ""}>Owner</option>
+                    </select>
+                """
+            else:
+                # Show static role badge
+                role_color = "bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-200" if membership.role == "owner" else "bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200"
+                role_selector = f'<span class="px-2 py-1 text-xs font-medium {role_color} rounded-full">{role_display}</span>'
+
+            # Remove button - hide for current user and last owner
+            if is_team_owner and not is_current_user and not is_last_owner:
+                remove_button = f"""
+                    <button
+                        class="text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300 focus:outline-none"
+                        hx-post="{root_path}/admin/teams/{team_id}/remove-member"
+                        hx-vals='{{"user_email": "{member_user.email}"}}'
+                        hx-confirm="Remove {member_user.email} from this team?"
+                        hx-target="#team-edit-modal-content"
+                        hx-swap="innerHTML"
+                        title="Remove member">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path>
+                        </svg>
+                    </button>
+                """
+            else:
+                remove_button = ""
+
+            # Special indicators
+            indicators = []
+            if is_current_user:
+                indicators.append('<span class="inline-flex items-center px-2 py-1 text-xs font-medium bg-blue-100 text-blue-800 rounded-full dark:bg-blue-900 dark:text-blue-200">You</span>')
+            if is_last_owner:
+                indicators.append(
+                    '<span class="inline-flex items-center px-2 py-1 text-xs font-medium bg-yellow-100 text-yellow-800 rounded-full dark:bg-yellow-900 dark:text-yellow-200">Last Owner</span>'
+                )
+
+            members_html += f"""
+                <div class="px-6 py-4 flex items-center justify-between">
+                    <div class="flex items-center space-x-4 flex-1">
+                        <div class="flex-shrink-0">
+                            <div class="w-8 h-8 bg-gray-300 dark:bg-gray-600 rounded-full flex items-center justify-center">
+                                <span class="text-sm font-medium text-gray-700 dark:text-gray-300">{member_user.email[0].upper()}</span>
+                            </div>
+                        </div>
+                        <div class="min-w-0 flex-1">
+                            <div class="flex items-center space-x-2">
+                                <p class="text-sm font-medium text-gray-900 dark:text-white truncate">{member_user.full_name or member_user.email}</p>
+                                {" ".join(indicators)}
+                            </div>
+                            <p class="text-sm text-gray-500 dark:text-gray-400 truncate">{member_user.email}</p>
+                            <p class="text-xs text-gray-400 dark:text-gray-500">Joined: {membership.joined_at.strftime("%b %d, %Y") if membership.joined_at else "Unknown"}</p>
+                        </div>
+                    </div>
+                    <div class="flex items-center space-x-3">
+                        {role_selector}
+                        {remove_button}
+                    </div>
+                </div>
+            """
+
+        members_html += """
+            </div>
+        </div>
+        """
+
+        if not members:
+            members_html = '<div class="text-center py-8 text-gray-500 dark:text-gray-400">No members found</div>'
+
+        # Add member management interface
+        management_html = f"""
+        <div class="mb-4">
+            <div class="flex justify-between items-center mb-4">
+                <h3 class="text-lg font-medium text-gray-900 dark:text-white">Manage Members: {team.name}</h3>
+                <button onclick="document.getElementById('team-edit-modal').classList.add('hidden')" class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                </button>
+            </div>"""
+
+        # Show Add Member interface for team owners
+        if is_team_owner:
+            management_html += f"""
+            <div class="mb-6">
+                <div class="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
+                    <div class="px-6 py-4 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900">
+                        <div class="flex items-center justify-between">
+                            <h4 class="text-sm font-semibold text-gray-900 dark:text-white">Add New Member</h4>
+                            <button
+                                id="toggle-add-member-{team.id}"
+                                class="text-sm text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 focus:outline-none"
+                                onclick="document.getElementById('add-member-form-{team.id}').classList.toggle('hidden'); this.textContent = this.textContent === 'Show' ? 'Hide' : 'Show';">
+                                Show
+                            </button>
+                        </div>
+                    </div>
+                    <div id="add-member-form-{team.id}" class="hidden px-6 py-4">
+                        <form hx-post="{root_path}/admin/teams/{team.id}/add-member" hx-target="#team-edit-modal-content" hx-swap="innerHTML">
+                            <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                                <div class="md:col-span-2">
+                                    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Select User</label>
+                                    <select name="user_email" required
+                                            class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 dark:bg-gray-700 text-gray-900 dark:text-white">
+                                        <option value="">Choose a user to add...</option>"""
+
+            # Get available users (not already members of this team)
+            try:
+                auth_service = EmailAuthService(db)
+                all_users = await auth_service.get_all_users()
+
+                # Get current team members
+                team_management_service = TeamManagementService(db)
+                team_members = await team_management_service.get_team_members(team.id)
+                member_emails = {team_user.email for team_user, membership in team_members}
+
+                # Filter out existing members
+                available_users = [team_user for team_user in all_users if team_user.email not in member_emails]
+
+                for team_user in available_users:
+                    management_html += f'<option value="{team_user.email}">{team_user.full_name} ({team_user.email})</option>'
+            except Exception as e:
+                LOGGER.error(f"Error loading available users for team {team.id}: {e}")
+
+            management_html += """                        </select>
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Role</label>
+                                    <select name="role" required
+                                            class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 dark:bg-gray-700 text-gray-900 dark:text-white">
+                                        <option value="member">Member</option>
+                                        <option value="owner">Owner</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div class="mt-4 flex justify-end space-x-3">
+                                <button type="submit"
+                                        class="px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-md shadow-sm hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 transition-colors duration-200">
+                                    Add Member
+                                </button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            </div>"""
+        else:
+            management_html += """
+            <div class="mb-4 p-4 bg-yellow-50 dark:bg-yellow-900 rounded-lg border border-yellow-200 dark:border-yellow-700">
+                <div class="flex items-center gap-2">
+                    <svg class="w-5 h-5 text-yellow-600 dark:text-yellow-400" fill="currentColor" viewBox="0 0 20 20">
+                        <path fill-rule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clip-rule="evenodd" />
+                    </svg>
+                    <span class="text-sm font-medium text-yellow-800 dark:text-yellow-200">Private Team - Member Access</span>
+                </div>
+                <p class="text-xs text-yellow-600 dark:text-yellow-400 mt-1">
+                    You are a member of this private team. Only team owners can directly add new members. Use the team invitation system to request access for others.
+                </p>
+            </div>"""
+
+        management_html += """
+        </div>
+        """
+
+        return HTMLResponse(content=f'{management_html}<div class="space-y-2">{members_html}</div>')
+
+    except Exception as e:
+        LOGGER.error(f"Error viewing team members {team_id}: {e}")
+        return HTMLResponse(content=f'<div class="text-red-500">Error loading members: {str(e)}</div>', status_code=500)
+
+
+@admin_router.get("/teams/{team_id}/edit")
+@require_permission("teams.update")
+async def admin_get_team_edit(
+    team_id: str,
+    _request: Request,
+    db: Session = Depends(get_db),
+    _user=Depends(get_current_user_with_permissions),
+) -> HTMLResponse:
+    """Get team edit form via admin UI.
+
+    Args:
+        team_id: ID of the team to edit
+        db: Database session
+
+    Returns:
+        HTMLResponse: Rendered team edit form
+    """
+    if not settings.email_auth_enabled:
+        return HTMLResponse(content='<div class="text-red-500">Email authentication is disabled</div>', status_code=403)
+
+    try:
+        # Get root path for URL construction
+        root_path = _request.scope.get("root_path", "") if _request else ""
+        team_service = TeamManagementService(db)
+
+        team = await team_service.get_team_by_id(team_id)
+        if not team:
+            return HTMLResponse(content='<div class="text-red-500">Team not found</div>', status_code=404)
+
+        edit_form = f"""
+        <div class="space-y-4">
+            <h3 class="text-lg font-semibold text-gray-900 dark:text-white mb-4">Edit Team</h3>
+            <form method="post" action="{root_path}/admin/teams/{team_id}/update" hx-post="{root_path}/admin/teams/{team_id}/update" hx-target="#team-edit-modal-content" class="space-y-4">
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Name</label>
+                    <input type="text" name="name" value="{team.name}" required
+                           class="mt-1 block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-700 text-gray-900 dark:text-white">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Slug</label>
+                    <input type="text" name="slug" value="{team.slug}" readonly
+                           class="mt-1 block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm bg-gray-50 dark:bg-gray-700 text-gray-900 dark:text-white">
+                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Slug cannot be changed</p>
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Description</label>
+                    <textarea name="description" rows="3"
+                              class="mt-1 block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-700 text-gray-900 dark:text-white">{team.description or ""}</textarea>
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Visibility</label>
+                    <select name="visibility"
+                            class="mt-1 block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-700 text-gray-900 dark:text-white">
+                        <option value="private" {"selected" if team.visibility == "private" else ""}>Private</option>
+                        <option value="public" {"selected" if team.visibility == "public" else ""}>Public</option>
+                    </select>
+                </div>
+                <div class="flex justify-end space-x-3">
+                    <button type="button" onclick="hideTeamEditModal()"
+                            class="px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-md hover:bg-gray-50 dark:hover:bg-gray-700">
+                        Cancel
+                    </button>
+                    <button type="submit"
+                            class="px-4 py-2 text-sm font-medium text-white bg-blue-600 border border-transparent rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500">
+                        Update Team
+                    </button>
+                </div>
+            </form>
+        </div>
+        """
+        return HTMLResponse(content=edit_form)
+
+    except Exception as e:
+        LOGGER.error(f"Error getting team edit form for {team_id}: {e}")
+        return HTMLResponse(content=f'<div class="text-red-500">Error loading team: {str(e)}</div>', status_code=500)
+
+
+@admin_router.post("/teams/{team_id}/update")
+@require_permission("teams.update")
+async def admin_update_team(
+    team_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> Response:
+    """Update team via admin UI.
+
+    Args:
+        team_id: ID of the team to update
+        request: FastAPI request object
+        db: Database session
+        user: Current authenticated user context
+
+    Returns:
+        Response: Result of team update operation
+    """
+    # Ensure root_path is available for URL construction in all branches
+    root_path = request.scope.get("root_path", "") if request else ""
+
+    if not settings.email_auth_enabled:
+        return HTMLResponse(content='<div class="text-red-500">Email authentication is disabled</div>', status_code=403)
+
+    try:
+        team_service = TeamManagementService(db)
+
+        form = await request.form()
+        name_val = form.get("name")
+        desc_val = form.get("description")
+        vis_val = form.get("visibility", "private")
+        name = name_val if isinstance(name_val, str) else None
+        description = desc_val if isinstance(desc_val, str) and desc_val != "" else None
+        visibility = vis_val if isinstance(vis_val, str) else "private"
+
+        if not name:
+            is_htmx = request.headers.get("HX-Request") == "true"
+            if is_htmx:
+                return HTMLResponse(content='<div class="text-red-500">Team name is required</div>', status_code=400)
+            error_msg = urllib.parse.quote("Team name is required")
+            return RedirectResponse(url=f"{root_path}/admin/?error={error_msg}#teams", status_code=303)
+
+        # Update team
+        user_email = getattr(user, "email", None) or str(user)
+        await team_service.update_team(team_id=team_id, name=name, description=description, visibility=visibility, updated_by=user_email)
+
+        # Check if this is an HTMX request
+        is_htmx = request.headers.get("HX-Request") == "true"
+
+        if is_htmx:
+            # Return success message with auto-close and refresh for HTMX
+            success_html = """
+            <div class="text-green-500 text-center p-4">
+                <p>Team updated successfully</p>
+                <script>
+                    setTimeout(() => {
+                        // Close the modal
+                        hideTeamEditModal();
+                        // Refresh the teams list
+                        htmx.trigger(document.getElementById('teams-list'), 'load');
+                    }, 1500);
+                </script>
+            </div>
+            """
+            return HTMLResponse(content=success_html)
+        # For regular form submission, redirect to admin page with teams section
+        return RedirectResponse(url=f"{root_path}/admin/#teams", status_code=303)
+
+    except Exception as e:
+        LOGGER.error(f"Error updating team {team_id}: {e}")
+
+        # Check if this is an HTMX request for error handling too
+        is_htmx = request.headers.get("HX-Request") == "true"
+
+        if is_htmx:
+            return HTMLResponse(content=f'<div class="text-red-500">Error updating team: {str(e)}</div>', status_code=400)
+        # For regular form submission, redirect to admin page with error parameter
+        error_msg = urllib.parse.quote(f"Error updating team: {str(e)}")
+        return RedirectResponse(url=f"{root_path}/admin/?error={error_msg}#teams", status_code=303)
+
+
+@admin_router.delete("/teams/{team_id}")
+@require_permission("teams.delete")
+async def admin_delete_team(
+    team_id: str,
+    _request: Request,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> HTMLResponse:
+    """Delete team via admin UI.
+
+    Args:
+        team_id: ID of the team to delete
+        db: Database session
+        user: Current authenticated user context
+
+    Returns:
+        HTMLResponse: Success message or error response
+    """
+    if not settings.email_auth_enabled:
+        return HTMLResponse(content='<div class="text-red-500">Email authentication is disabled</div>', status_code=403)
+
+    try:
+        team_service = TeamManagementService(db)
+
+        # Get team name for success message
+        team = await team_service.get_team_by_id(team_id)
+        team_name = team.name if team else "Unknown"
+
+        # Delete team (get user email from JWT payload)
+        user_email = get_user_email(user)
+        await team_service.delete_team(team_id, deleted_by=user_email)
+
+        # Return success message with script to refresh teams list
+        success_html = f"""
+        <div class="text-green-500 text-center p-4">
+            <p>Team "{team_name}" deleted successfully</p>
+            <script>
+                setTimeout(() => {{
+                    // Refresh the entire teams list
+                    htmx.ajax('GET', window.ROOT_PATH + '/admin/teams?unified=true', {{
+                        target: '#unified-teams-list',
+                        swap: 'innerHTML'
+                    }});
+                }}, 1000);
+            </script>
+        </div>
+        """
+        return HTMLResponse(content=success_html)
+
+    except Exception as e:
+        LOGGER.error(f"Error deleting team {team_id}: {e}")
+        return HTMLResponse(content=f'<div class="text-red-500">Error deleting team: {str(e)}</div>', status_code=400)
+
+
+@admin_router.post("/teams/{team_id}/add-member")
+@require_permission("teams.write")  # Team write permission instead of admin user management
+async def admin_add_team_member(
+    team_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> HTMLResponse:
+    """Add member to team via admin UI.
+
+    Args:
+        team_id: ID of the team to add member to
+        request: FastAPI request object
+        db: Database session
+        user: Current authenticated user context
+
+    Returns:
+        HTMLResponse: Success message or error response
+    """
+    if not settings.email_auth_enabled:
+        return HTMLResponse(content='<div class="text-red-500">Email authentication is disabled</div>', status_code=403)
+
+    try:
+        # First-Party
+        from mcpgateway.services.email_auth_service import EmailAuthService  # pylint: disable=import-outside-toplevel  # pylint: disable=import-outside-toplevel
+
+        team_service = TeamManagementService(db)
+        auth_service = EmailAuthService(db)
+
+        # Check if team exists and validate visibility
+        team = await team_service.get_team_by_id(team_id)
+        if not team:
+            return HTMLResponse(content='<div class="text-red-500">Team not found</div>', status_code=404)
+
+        # For private teams, only team owners can add members directly
+        user_email_from_jwt = get_user_email(user)
+        if team.visibility == "private":
+            user_role = await team_service.get_user_role_in_team(user_email_from_jwt, team_id)
+            if user_role != "owner":
+                return HTMLResponse(content='<div class="text-red-500">Only team owners can add members to private teams. Use the invitation system instead.</div>', status_code=403)
+
+        form = await request.form()
+        email_val = form.get("user_email")
+        role_val = form.get("role", "member")
+        user_email = email_val if isinstance(email_val, str) else None
+        role = role_val if isinstance(role_val, str) else "member"
+
+        if not user_email:
+            return HTMLResponse(content='<div class="text-red-500">User email is required</div>', status_code=400)
+
+        # Check if user exists
+        target_user = await auth_service.get_user_by_email(user_email)
+        if not target_user:
+            return HTMLResponse(content=f'<div class="text-red-500">User {user_email} not found</div>', status_code=400)
+
+        # Add member to team
+        await team_service.add_member_to_team(team_id=team_id, user_email=user_email, role=role, invited_by=user_email_from_jwt)
+
+        # Return success message with script to refresh modal
+        success_html = f"""
+        <div class="text-green-500 text-center p-4">
+            <p>Member {user_email} added successfully</p>
+            <script>
+                setTimeout(() => {{
+                    // Reload the manage members modal content
+                    htmx.ajax('GET', window.ROOT_PATH + '/admin/teams/{team_id}/members', {{
+                        target: '#team-edit-modal-content',
+                        swap: 'innerHTML'
+                    }});
+
+                    // Also refresh the teams list to update member counts
+                    htmx.ajax('GET', window.ROOT_PATH + '/admin/teams?unified=true', {{
+                        target: '#unified-teams-list',
+                        swap: 'innerHTML'
+                    }});
+                }}, 1000);
+            </script>
+        </div>
+        """
+        return HTMLResponse(content=success_html)
+
+    except Exception as e:
+        LOGGER.error(f"Error adding member to team {team_id}: {e}")
+        return HTMLResponse(content=f'<div class="text-red-500">Error adding member: {str(e)}</div>', status_code=400)
+
+
+@admin_router.post("/teams/{team_id}/update-member-role")
+@require_permission("teams.write")
+async def admin_update_team_member_role(
+    team_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> HTMLResponse:
+    """Update team member role via admin UI.
+
+    Args:
+        team_id: ID of the team containing the member
+        request: FastAPI request object
+        db: Database session
+        user: Current authenticated user context
+
+    Returns:
+        HTMLResponse: Success message or error response
+    """
+    if not settings.email_auth_enabled:
+        return HTMLResponse(content='<div class="text-red-500">Email authentication is disabled</div>', status_code=403)
+
+    try:
+        team_service = TeamManagementService(db)
+
+        # Check if team exists and validate user permissions
+        team = await team_service.get_team_by_id(team_id)
+        if not team:
+            return HTMLResponse(content='<div class="text-red-500">Team not found</div>', status_code=404)
+
+        # Only team owners can modify member roles
+        user_email_from_jwt = get_user_email(user)
+        user_role = await team_service.get_user_role_in_team(user_email_from_jwt, team_id)
+        if user_role != "owner":
+            return HTMLResponse(content='<div class="text-red-500">Only team owners can modify member roles</div>', status_code=403)
+
+        form = await request.form()
+        ue_val = form.get("user_email")
+        nr_val = form.get("role", "member")
+        user_email = ue_val if isinstance(ue_val, str) else None
+        new_role = nr_val if isinstance(nr_val, str) else "member"
+
+        if not user_email:
+            return HTMLResponse(content='<div class="text-red-500">User email is required</div>', status_code=400)
+
+        if not new_role:
+            return HTMLResponse(content='<div class="text-red-500">Role is required</div>', status_code=400)
+
+        # Update member role
+        await team_service.update_member_role(team_id=team_id, user_email=user_email, new_role=new_role, updated_by=user_email_from_jwt)
+
+        # Return success message with auto-close and refresh
+        success_html = f"""
+        <div class="text-green-500 text-center p-4">
+            <p>Role updated successfully for {user_email}</p>
+            <script>
+                setTimeout(() => {{
+                    // Reload the manage members modal content to show updated roles
+                    htmx.ajax('GET', window.ROOT_PATH + '/admin/teams/{team_id}/members', {{
+                        target: '#team-edit-modal-content',
+                        swap: 'innerHTML'
+                    }});
+
+                    // Close any open modals
+                    const roleModal = document.getElementById('role-assignment-modal');
+                    if (roleModal) {{
+                        roleModal.classList.add('hidden');
+                    }}
+
+                    // Refresh teams list if visible
+                    htmx.ajax('GET', window.ROOT_PATH + '/admin/teams?unified=true', {{
+                        target: '#unified-teams-list',
+                        swap: 'innerHTML'
+                    }});
+                }}, 1000);
+            </script>
+        </div>
+        """
+        return HTMLResponse(content=success_html)
+
+    except Exception as e:
+        LOGGER.error(f"Error updating member role in team {team_id}: {e}")
+        return HTMLResponse(content=f'<div class="text-red-500">Error updating role: {str(e)}</div>', status_code=400)
+
+
+@admin_router.post("/teams/{team_id}/remove-member")
+@require_permission("teams.write")  # Team write permission instead of admin user management
+async def admin_remove_team_member(
+    team_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> HTMLResponse:
+    """Remove member from team via admin UI.
+
+    Args:
+        team_id: ID of the team to remove member from
+        request: FastAPI request object
+        db: Database session
+        user: Current authenticated user context
+
+    Returns:
+        HTMLResponse: Success message or error response
+    """
+    if not settings.email_auth_enabled:
+        return HTMLResponse(content='<div class="text-red-500">Email authentication is disabled</div>', status_code=403)
+
+    try:
+        team_service = TeamManagementService(db)
+
+        # Check if team exists and validate user permissions
+        team = await team_service.get_team_by_id(team_id)
+        if not team:
+            return HTMLResponse(content='<div class="text-red-500">Team not found</div>', status_code=404)
+
+        # Only team owners can remove members
+        user_email_from_jwt = get_user_email(user)
+        user_role = await team_service.get_user_role_in_team(user_email_from_jwt, team_id)
+        if user_role != "owner":
+            return HTMLResponse(content='<div class="text-red-500">Only team owners can remove members</div>', status_code=403)
+
+        form = await request.form()
+        ue_val = form.get("user_email")
+        user_email = ue_val if isinstance(ue_val, str) else None
+
+        if not user_email:
+            return HTMLResponse(content='<div class="text-red-500">User email is required</div>', status_code=400)
+
+        # Remove member from team
+
+        try:
+            success = await team_service.remove_member_from_team(team_id=team_id, user_email=user_email, removed_by=user_email_from_jwt)
+            if not success:
+                return HTMLResponse(content='<div class="text-red-500">Failed to remove member from team</div>', status_code=400)
+        except ValueError as e:
+            # Handle specific business logic errors (like last owner)
+            return HTMLResponse(content=f'<div class="text-red-500">{str(e)}</div>', status_code=400)
+
+        # Return success message with script to refresh modal
+        success_html = f"""
+        <div class="text-green-500 text-center p-4">
+            <p>Member {user_email} removed successfully</p>
+            <script>
+                setTimeout(() => {{
+                    // Reload the manage members modal content
+                    htmx.ajax('GET', window.ROOT_PATH + '/admin/teams/{team_id}/members', {{
+                        target: '#team-edit-modal-content',
+                        swap: 'innerHTML'
+                    }});
+
+                    // Also refresh the teams list to update member counts
+                    htmx.ajax('GET', window.ROOT_PATH + '/admin/teams?unified=true', {{
+                        target: '#unified-teams-list',
+                        swap: 'innerHTML'
+                    }});
+                }}, 1000);
+            </script>
+        </div>
+        """
+        return HTMLResponse(content=success_html)
+
+    except Exception as e:
+        LOGGER.error(f"Error removing member from team {team_id}: {e}")
+        return HTMLResponse(content=f'<div class="text-red-500">Error removing member: {str(e)}</div>', status_code=400)
+
+
+@admin_router.post("/teams/{team_id}/leave")
+@require_permission("teams.join")  # Users who can join can also leave
+async def admin_leave_team(
+    team_id: str,
+    request: Request,  # pylint: disable=unused-argument
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> HTMLResponse:
+    """Leave a team via admin UI.
+
+    Args:
+        team_id: ID of the team to leave
+        request: FastAPI request object
+        db: Database session
+        user: Current authenticated user context
+
+    Returns:
+        HTMLResponse: Success message or error response
+    """
+    if not settings.email_auth_enabled:
+        return HTMLResponse(content='<div class="text-red-500">Email authentication is disabled</div>', status_code=403)
+
+    try:
+        team_service = TeamManagementService(db)
+
+        # Check if team exists
+        team = await team_service.get_team_by_id(team_id)
+        if not team:
+            return HTMLResponse(content='<div class="text-red-500">Team not found</div>', status_code=404)
+
+        # Get current user email
+        user_email = get_user_email(user)
+
+        # Check if user is a member of the team
+        user_role = await team_service.get_user_role_in_team(user_email, team_id)
+        if not user_role:
+            return HTMLResponse(content='<div class="text-red-500">You are not a member of this team</div>', status_code=400)
+
+        # Prevent leaving personal teams
+        if team.is_personal:
+            return HTMLResponse(content='<div class="text-red-500">Cannot leave your personal team</div>', status_code=400)
+
+        # Check if user is the last owner
+        if user_role == "owner":
+            members = await team_service.get_team_members(team_id)
+            owner_count = sum(1 for _, membership in members if membership.role == "owner")
+            if owner_count <= 1:
+                return HTMLResponse(content='<div class="text-red-500">Cannot leave team as the last owner. Transfer ownership or delete the team instead.</div>', status_code=400)
+
+        # Remove user from team
+        success = await team_service.remove_member_from_team(team_id=team_id, user_email=user_email, removed_by=user_email)
+        if not success:
+            return HTMLResponse(content='<div class="text-red-500">Failed to leave team</div>', status_code=400)
+
+        # Return success message with redirect
+        success_html = """
+        <div class="text-green-500 text-center p-4">
+            <p>Successfully left the team</p>
+            <script>
+                setTimeout(() => {{
+                    // Refresh the unified teams list
+                    htmx.ajax('GET', window.ROOT_PATH + '/admin/teams?unified=true', {{
+                        target: '#unified-teams-list',
+                        swap: 'innerHTML'
+                    }});
+
+                    // Close any open modals
+                    const modals = document.querySelectorAll('[id$="-modal"]');
+                    modals.forEach(modal => modal.classList.add('hidden'));
+                }}, 1500);
+            </script>
+        </div>
+        """
+        return HTMLResponse(content=success_html)
+
+    except Exception as e:
+        LOGGER.error(f"Error leaving team {team_id}: {e}")
+        return HTMLResponse(content=f'<div class="text-red-500">Error leaving team: {str(e)}</div>', status_code=400)
+
+
+# ============================================================================ #
+#                         TEAM JOIN REQUEST ADMIN ROUTES                      #
+# ============================================================================ #
+
+
+@admin_router.post("/teams/{team_id}/join-request")
+async def admin_create_join_request(
+    team_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> HTMLResponse:
+    """Create a join request for a team via admin UI.
+
+    Args:
+        team_id: ID of the team to request to join
+        request: FastAPI request object
+        db: Database session
+        user: Authenticated user
+
+    Returns:
+        HTML response with success message or error
+    """
+    if not getattr(settings, "email_auth_enabled", False):
+        return HTMLResponse(content='<div class="text-red-500">Email authentication is disabled</div>', status_code=403)
+
+    try:
+        team_service = TeamManagementService(db)
+        user_email = get_user_email(user)
+
+        # Get team to verify it's public
+        team = await team_service.get_team_by_id(team_id)
+        if not team:
+            return HTMLResponse(content='<div class="text-red-500">Team not found</div>', status_code=404)
+
+        if team.visibility != "public":
+            return HTMLResponse(content='<div class="text-red-500">Can only request to join public teams</div>', status_code=400)
+
+        # Check if user is already a member
+        user_role = await team_service.get_user_role_in_team(user_email, team_id)
+        if user_role:
+            return HTMLResponse(content='<div class="text-red-500">You are already a member of this team</div>', status_code=400)
+
+        # Check if user already has a pending request
+        existing_requests = await team_service.get_user_join_requests(user_email, team_id)
+        pending_request = next((req for req in existing_requests if req.status == "pending"), None)
+        if pending_request:
+            return HTMLResponse(
+                content=f"""
+            <div class="text-yellow-600">
+                <p>You already have a pending request to join this team.</p>
+                <button onclick="cancelJoinRequest('{team_id}', '{pending_request.id}')"
+                        class="mt-2 px-3 py-1 text-sm font-medium text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300 border border-red-300 dark:border-red-600 hover:border-red-500 dark:hover:border-red-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500">
+                    Cancel Request
+                </button>
+            </div>
+            """,
+                status_code=200,
+            )
+
+        # Get form data for optional message
+        form = await request.form()
+        msg_val = form.get("message", "")
+        message = msg_val if isinstance(msg_val, str) else ""
+
+        # Create join request
+        join_request = await team_service.create_join_request(team_id=team_id, user_email=user_email, message=message)
+
+        return HTMLResponse(
+            content=f"""
+        <div class="text-green-600">
+            <p>Join request submitted successfully!</p>
+            <button onclick="cancelJoinRequest('{team_id}', '{join_request.id}')"
+                    class="mt-2 px-3 py-1 text-sm font-medium text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300 border border-red-300 dark:border-red-600 hover:border-red-500 dark:hover:border-red-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500">
+                Cancel Request
+            </button>
+        </div>
+        """,
+            status_code=201,
+        )
+
+    except Exception as e:
+        LOGGER.error(f"Error creating join request for team {team_id}: {e}")
+        return HTMLResponse(content=f'<div class="text-red-500">Error creating join request: {str(e)}</div>', status_code=400)
+
+
+@admin_router.delete("/teams/{team_id}/join-request/{request_id}")
+@require_permission("teams.join")
+async def admin_cancel_join_request(
+    team_id: str,
+    request_id: str,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> HTMLResponse:
+    """Cancel a join request via admin UI.
+
+    Args:
+        team_id: ID of the team
+        request_id: ID of the join request to cancel
+        db: Database session
+        user: Authenticated user
+
+    Returns:
+        HTML response with updated button state
+    """
+    if not getattr(settings, "email_auth_enabled", False):
+        return HTMLResponse(content='<div class="text-red-500">Email authentication is disabled</div>', status_code=403)
+
+    try:
+        team_service = TeamManagementService(db)
+        user_email = get_user_email(user)
+
+        # Cancel the join request
+        success = await team_service.cancel_join_request(request_id, user_email)
+        if not success:
+            return HTMLResponse(content='<div class="text-red-500">Failed to cancel join request</div>', status_code=400)
+
+        # Return the "Request to Join" button
+        return HTMLResponse(
+            content=f"""
+        <button data-team-id="{team_id}" data-team-name="Team" onclick="requestToJoinTeamSafe(this)"
+                class="px-3 py-1 text-sm font-medium text-indigo-600 dark:text-indigo-400 hover:text-indigo-800 dark:hover:text-indigo-300 border border-indigo-300 dark:border-indigo-600 hover:border-indigo-500 dark:hover:border-indigo-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500">
+            Request to Join
+        </button>
+        """,
+            status_code=200,
+        )
+
+    except Exception as e:
+        LOGGER.error(f"Error canceling join request {request_id}: {e}")
+        return HTMLResponse(content=f'<div class="text-red-500">Error canceling join request: {str(e)}</div>', status_code=400)
+
+
+@admin_router.get("/teams/{team_id}/join-requests")
+@require_permission("teams.manage_members")
+async def admin_list_join_requests(
+    team_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> HTMLResponse:
+    """List join requests for a team via admin UI.
+
+    Args:
+        team_id: ID of the team
+        request: FastAPI request object
+        db: Database session
+        user: Authenticated user
+
+    Returns:
+        HTML response with join requests list
+    """
+    if not getattr(settings, "email_auth_enabled", False):
+        return HTMLResponse(content='<div class="text-red-500">Email authentication is disabled</div>', status_code=403)
+
+    try:
+        team_service = TeamManagementService(db)
+        user_email = get_user_email(user)
+        request.scope.get("root_path", "")
+
+        # Get team and verify ownership
+        team = await team_service.get_team_by_id(team_id)
+        if not team:
+            return HTMLResponse(content='<div class="text-red-500">Team not found</div>', status_code=404)
+
+        user_role = await team_service.get_user_role_in_team(user_email, team_id)
+        if user_role != "owner":
+            return HTMLResponse(content='<div class="text-red-500">Only team owners can view join requests</div>', status_code=403)
+
+        # Get join requests
+        join_requests = await team_service.list_join_requests(team_id)
+
+        if not join_requests:
+            return HTMLResponse(
+                content="""
+            <div class="text-center py-8">
+                <p class="text-gray-500 dark:text-gray-400">No pending join requests</p>
+            </div>
+            """,
+                status_code=200,
+            )
+
+        requests_html = ""
+        for req in join_requests:
+            requests_html += f"""
+            <div class="flex justify-between items-center p-4 border border-gray-200 dark:border-gray-600 rounded-lg mb-3">
+                <div>
+                    <p class="font-medium text-gray-900 dark:text-white">{req.user_email}</p>
+                    <p class="text-sm text-gray-600 dark:text-gray-400">Requested: {req.requested_at.strftime("%Y-%m-%d %H:%M") if req.requested_at else "Unknown"}</p>
+                    {f'<p class="text-sm text-gray-600 dark:text-gray-400 mt-1">Message: {req.message}</p>' if req.message else ""}
+                    <span class="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-300">{req.status.upper()}</span>
+                </div>
+                <div class="flex gap-2">
+                    <button onclick="approveJoinRequest('{team_id}', '{req.id}')"
+                            class="px-3 py-1 text-sm font-medium text-green-600 dark:text-green-400 hover:text-green-800 dark:hover:text-green-300 border border-green-300 dark:border-green-600 hover:border-green-500 dark:hover:border-green-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-green-500">
+                        Approve
+                    </button>
+                    <button onclick="rejectJoinRequest('{team_id}', '{req.id}')"
+                            class="px-3 py-1 text-sm font-medium text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300 border border-red-300 dark:border-red-600 hover:border-red-500 dark:hover:border-red-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500">
+                        Reject
+                    </button>
+                </div>
+            </div>
+            """
+
+        return HTMLResponse(
+            content=f"""
+        <div class="space-y-4">
+            <h3 class="text-lg font-medium text-gray-900 dark:text-white mb-4">Join Requests for {team.name}</h3>
+            {requests_html}
+        </div>
+        """,
+            status_code=200,
+        )
+
+    except Exception as e:
+        LOGGER.error(f"Error listing join requests for team {team_id}: {e}")
+        return HTMLResponse(content=f'<div class="text-red-500">Error loading join requests: {str(e)}</div>', status_code=400)
+
+
+@admin_router.post("/teams/{team_id}/join-requests/{request_id}/approve")
+@require_permission("teams.manage_members")
+async def admin_approve_join_request(
+    team_id: str,
+    request_id: str,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> HTMLResponse:
+    """Approve a join request via admin UI.
+
+    Args:
+        team_id: ID of the team
+        request_id: ID of the join request to approve
+        db: Database session
+        user: Authenticated user
+
+    Returns:
+        HTML response with success message
+    """
+    if not getattr(settings, "email_auth_enabled", False):
+        return HTMLResponse(content='<div class="text-red-500">Email authentication is disabled</div>', status_code=403)
+
+    try:
+        team_service = TeamManagementService(db)
+        user_email = get_user_email(user)
+
+        # Verify team ownership
+        user_role = await team_service.get_user_role_in_team(user_email, team_id)
+        if user_role != "owner":
+            return HTMLResponse(content='<div class="text-red-500">Only team owners can approve join requests</div>', status_code=403)
+
+        # Approve join request
+        member = await team_service.approve_join_request(request_id, approved_by=user_email)
+        if not member:
+            return HTMLResponse(content='<div class="text-red-500">Join request not found</div>', status_code=404)
+
+        return HTMLResponse(
+            content=f"""
+        <div class="text-green-600 text-center p-4">
+            <p>Join request approved! {member.user_email} is now a team member.</p>
+            <script>
+                setTimeout(() => {{
+                    // Refresh the join requests list
+                    htmx.ajax('GET', window.ROOT_PATH + '/admin/teams/{team_id}/join-requests', {{
+                        target: '#team-join-requests-modal-content',
+                        swap: 'innerHTML'
+                    }});
+                }}, 1000);
+            </script>
+        </div>
+        """,
+            status_code=200,
+        )
+
+    except Exception as e:
+        LOGGER.error(f"Error approving join request {request_id}: {e}")
+        return HTMLResponse(content=f'<div class="text-red-500">Error approving join request: {str(e)}</div>', status_code=400)
+
+
+@admin_router.post("/teams/{team_id}/join-requests/{request_id}/reject")
+@require_permission("teams.manage_members")
+async def admin_reject_join_request(
+    team_id: str,
+    request_id: str,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> HTMLResponse:
+    """Reject a join request via admin UI.
+
+    Args:
+        team_id: ID of the team
+        request_id: ID of the join request to reject
+        db: Database session
+        user: Authenticated user
+
+    Returns:
+        HTML response with success message
+    """
+    if not getattr(settings, "email_auth_enabled", False):
+        return HTMLResponse(content='<div class="text-red-500">Email authentication is disabled</div>', status_code=403)
+
+    try:
+        team_service = TeamManagementService(db)
+        user_email = get_user_email(user)
+
+        # Verify team ownership
+        user_role = await team_service.get_user_role_in_team(user_email, team_id)
+        if user_role != "owner":
+            return HTMLResponse(content='<div class="text-red-500">Only team owners can reject join requests</div>', status_code=403)
+
+        # Reject join request
+        success = await team_service.reject_join_request(request_id, rejected_by=user_email)
+        if not success:
+            return HTMLResponse(content='<div class="text-red-500">Join request not found</div>', status_code=404)
+
+        return HTMLResponse(
+            content=f"""
+        <div class="text-green-600 text-center p-4">
+            <p>Join request rejected.</p>
+            <script>
+                setTimeout(() => {{
+                    // Refresh the join requests list
+                    htmx.ajax('GET', window.ROOT_PATH + '/admin/teams/{team_id}/join-requests', {{
+                        target: '#team-join-requests-modal-content',
+                        swap: 'innerHTML'
+                    }});
+                }}, 1000);
+            </script>
+        </div>
+        """,
+            status_code=200,
+        )
+
+    except Exception as e:
+        LOGGER.error(f"Error rejecting join request {request_id}: {e}")
+        return HTMLResponse(content=f'<div class="text-red-500">Error rejecting join request: {str(e)}</div>', status_code=400)
+
+
+# ============================================================================ #
+#                         USER MANAGEMENT ADMIN ROUTES                        #
+# ============================================================================ #
+
+
+@admin_router.get("/users")
+@require_permission("admin.user_management")
+async def admin_list_users(
+    request: Request,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> Response:
+    """List users for admin UI via HTMX.
+
+    Args:
+        request: FastAPI request object
+        db: Database session
+        user: Current authenticated user context
+
+    Returns:
+        Response: HTML or JSON response with users list
+    """
+    try:
+        if not settings.email_auth_enabled:
+            return HTMLResponse(content='<div class="text-center py-8"><p class="text-gray-500">Email authentication is disabled. User management requires email auth.</p></div>', status_code=200)
+
+        # Get root_path from request
+        root_path = request.scope.get("root_path", "")
+
+        # First-Party
+        from mcpgateway.services.email_auth_service import EmailAuthService  # pylint: disable=import-outside-toplevel
+
+        auth_service = EmailAuthService(db)
+
+        # List all users (admin endpoint)
+        users = await auth_service.list_users()
+
+        # Check if JSON response is requested (for dropdown population)
+        accept_header = request.headers.get("accept", "")
+        is_json_request = "application/json" in accept_header or request.query_params.get("format") == "json"
+
+        if is_json_request:
+            # Return JSON for dropdown population
+            users_data = []
+            for user_obj in users:
+                users_data.append({"email": user_obj.email, "full_name": user_obj.full_name, "is_active": user_obj.is_active, "is_admin": user_obj.is_admin})
+            return JSONResponse(content={"users": users_data})
+
+        # Generate HTML for users
+        users_html = ""
+        current_user_email = get_user_email(user)
+
+        # Check how many active admins we have to determine if we should hide buttons for last admin
+        admin_count = await auth_service.count_active_admin_users()
+
+        for user_obj in users:
+            status_class = "text-green-600" if user_obj.is_active else "text-red-600"
+            status_text = "Active" if user_obj.is_active else "Inactive"
+            admin_badge = '<span class="px-2 py-1 text-xs font-semibold bg-purple-100 text-purple-800 rounded-full dark:bg-purple-900 dark:text-purple-200">Admin</span>' if user_obj.is_admin else ""
+            is_current_user = user_obj.email == current_user_email
+            is_last_admin = user_obj.is_admin and user_obj.is_active and admin_count == 1
+
+            # Build activate/deactivate buttons (hide for current user and last admin)
+            activate_deactivate_button = ""
+            if not is_current_user and not is_last_admin:
+                if not user_obj.is_active:
+                    activate_deactivate_button = f'<button class="px-3 py-1 text-sm font-medium text-green-600 dark:text-green-400 hover:text-green-800 dark:hover:text-green-300 border border-green-300 dark:border-green-600 hover:border-green-500 dark:hover:border-green-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-green-500" hx-post="{root_path}/admin/users/{urllib.parse.quote(user_obj.email, safe="")}/activate" hx-confirm="Activate this user?" hx-target="closest .user-card" hx-swap="outerHTML">Activate</button>'
+                else:
+                    activate_deactivate_button = f'<button class="px-3 py-1 text-sm font-medium text-orange-600 dark:text-orange-400 hover:text-orange-800 dark:hover:text-orange-300 border border-orange-300 dark:border-orange-600 hover:border-orange-500 dark:hover:border-orange-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-orange-500" hx-post="{root_path}/admin/users/{urllib.parse.quote(user_obj.email, safe="")}/deactivate" hx-confirm="Deactivate this user?" hx-target="closest .user-card" hx-swap="outerHTML">Deactivate</button>'
+
+            # Build delete button (hide for current user and last admin)
+            delete_button = ""
+            if not is_current_user and not is_last_admin:
+                delete_button = f'<button class="px-3 py-1 text-sm font-medium text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300 border border-red-300 dark:border-red-600 hover:border-red-500 dark:hover:border-red-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500" hx-delete="{root_path}/admin/users/{urllib.parse.quote(user_obj.email, safe="")}" hx-confirm="Are you sure you want to delete this user? This action cannot be undone." hx-target="closest .user-card" hx-swap="outerHTML">Delete</button>'
+
+            users_html += f"""
+            <div class="user-card border border-gray-200 dark:border-gray-700 rounded-lg p-4 bg-white dark:bg-gray-800">
+                <div class="flex justify-between items-start">
+                    <div class="flex-1">
+                        <div class="flex items-center gap-2 mb-2">
+                            <h3 class="text-lg font-semibold text-gray-900 dark:text-white">{user_obj.full_name or "N/A"}</h3>
+                            {admin_badge}
+                            <span class="px-2 py-1 text-xs font-semibold {status_class} bg-gray-100 dark:bg-gray-700 rounded-full">{status_text}</span>
+                            {'<span class="px-2 py-1 text-xs font-semibold bg-blue-100 text-blue-800 rounded-full dark:bg-blue-900 dark:text-blue-200">You</span>' if is_current_user else ""}
+                            {'<span class="px-2 py-1 text-xs font-semibold bg-yellow-100 text-yellow-800 rounded-full dark:bg-yellow-900 dark:text-yellow-200">Last Admin</span>' if is_last_admin else ""}
+                        </div>
+                        <p class="text-sm text-gray-600 dark:text-gray-400 mb-2">📧 {user_obj.email}</p>
+                        <p class="text-sm text-gray-600 dark:text-gray-400 mb-2">🔐 Provider: {user_obj.auth_provider}</p>
+                        <p class="text-sm text-gray-600 dark:text-gray-400">📅 Created: {user_obj.created_at.strftime("%Y-%m-%d %H:%M")}</p>
+                    </div>
+                    <div class="flex gap-2 ml-4">
+                        <button class="px-3 py-1 text-sm font-medium text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 border border-blue-300 dark:border-blue-600 hover:border-blue-500 dark:hover:border-blue-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
+                                hx-get="{root_path}/admin/users/{urllib.parse.quote(user_obj.email, safe="")}/edit" hx-target="#user-edit-modal-content">
+                            Edit
+                        </button>
+                        {activate_deactivate_button}
+                        {delete_button}
+                    </div>
+                </div>
+            </div>
+            """
+
+        if not users_html:
+            users_html = '<div class="text-center py-8"><p class="text-gray-500 dark:text-gray-400">No users found.</p></div>'
+
+        return HTMLResponse(content=users_html)
+
+    except Exception as e:
+        LOGGER.error(f"Error listing users for admin {user}: {e}")
+        return HTMLResponse(content=f'<div class="text-center py-8"><p class="text-red-500">Error loading users: {str(e)}</p></div>', status_code=200)
+
+
+@admin_router.post("/users")
+@require_permission("admin.user_management")
+async def admin_create_user(
+    request: Request,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> HTMLResponse:
+    """Create a new user via admin UI.
+
+    Args:
+        request: FastAPI request object
+        db: Database session
+        user: Current authenticated user context
+
+    Returns:
+        HTMLResponse: Success message or error response
+    """
+    try:
+        # Get root path for URL construction
+        root_path = request.scope.get("root_path", "") if request else ""
+
+        form = await request.form()
+
+        # First-Party
+        from mcpgateway.services.email_auth_service import EmailAuthService  # pylint: disable=import-outside-toplevel
+
+        auth_service = EmailAuthService(db)
+
+        # Create new user
+        new_user = await auth_service.create_user(
+            email=str(form.get("email", "")), password=str(form.get("password", "")), full_name=str(form.get("full_name", "")), is_admin=form.get("is_admin") == "on", auth_provider="local"
+        )
+
+        LOGGER.info(f"Admin {user} created user: {new_user.email}")
+
+        # Generate HTML for the new user
+        status_class = "text-green-600"
+        status_text = "Active"
+        admin_badge = '<span class="px-2 py-1 text-xs font-semibold bg-purple-100 text-purple-800 rounded-full dark:bg-purple-900 dark:text-purple-200">Admin</span>' if new_user.is_admin else ""
+
+        user_html = f"""
+        <div class="border border-gray-200 dark:border-gray-700 rounded-lg p-4 bg-white dark:bg-gray-800">
+            <div class="flex justify-between items-start">
+                <div class="flex-1">
+                    <div class="flex items-center gap-2 mb-2">
+                        <h3 class="text-lg font-semibold text-gray-900 dark:text-white">{new_user.full_name or "N/A"}</h3>
+                        {admin_badge}
+                        <span class="px-2 py-1 text-xs font-semibold {status_class} bg-gray-100 dark:bg-gray-700 rounded-full">{status_text}</span>
+                    </div>
+                    <p class="text-sm text-gray-600 dark:text-gray-400 mb-2">📧 {new_user.email}</p>
+                    <p class="text-sm text-gray-600 dark:text-gray-400 mb-2">🔐 Provider: {new_user.auth_provider}</p>
+                    <p class="text-sm text-gray-600 dark:text-gray-400">📅 Created: {new_user.created_at.strftime("%Y-%m-%d %H:%M")}</p>
+                </div>
+                <div class="flex gap-2 ml-4">
+                    <button class="px-3 py-1 text-sm font-medium text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 border border-blue-300 dark:border-blue-600 hover:border-blue-500 dark:hover:border-blue-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
+                            hx-get="{root_path}/admin/users/{new_user.email}/edit" hx-target="#user-edit-modal-content">
+                        Edit
+                    </button>
+                    <button class="px-3 py-1 text-sm font-medium text-orange-600 dark:text-orange-400 hover:text-orange-800 dark:hover:text-orange-300 border border-orange-300 dark:border-orange-600 hover:border-orange-500 dark:hover:border-orange-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-orange-500" hx-post="{root_path}/admin/users/{new_user.email.replace("@", "%40")}/deactivate" hx-confirm="Deactivate this user?" hx-target="closest .border">Deactivate</button>
+                </div>
+            </div>
+        </div>
+        """
+
+        return HTMLResponse(content=user_html, status_code=201)
+
+    except Exception as e:
+        LOGGER.error(f"Error creating user by admin {user}: {e}")
+        return HTMLResponse(content=f'<div class="text-red-500">Error creating user: {str(e)}</div>', status_code=400)
+
+
+@admin_router.get("/users/{user_email}/edit")
+@require_permission("admin.user_management")
+async def admin_get_user_edit(
+    user_email: str,
+    _request: Request,
+    db: Session = Depends(get_db),
+    _user=Depends(get_current_user_with_permissions),
+) -> HTMLResponse:
+    """Get user edit form via admin UI.
+
+    Args:
+        user_email: Email of user to edit
+        db: Database session
+
+    Returns:
+        HTMLResponse: User edit form HTML
+    """
+    if not settings.email_auth_enabled:
+        return HTMLResponse(content='<div class="text-red-500">Email authentication is disabled</div>', status_code=403)
+
+    try:
+        # Get root path for URL construction
+        root_path = _request.scope.get("root_path", "") if _request else ""
+
+        # First-Party
+        from mcpgateway.services.email_auth_service import EmailAuthService  # pylint: disable=import-outside-toplevel  # pylint: disable=import-outside-toplevel
+
+        auth_service = EmailAuthService(db)
+
+        # URL decode the email
+
+        decoded_email = urllib.parse.unquote(user_email)
+
+        user_obj = await auth_service.get_user_by_email(decoded_email)
+        if not user_obj:
+            return HTMLResponse(content='<div class="text-red-500">User not found</div>', status_code=404)
+
+        # Create edit form HTML
+        edit_form = f"""
+        <div class="space-y-4">
+            <h3 class="text-lg font-semibold text-gray-900 dark:text-white mb-4">Edit User</h3>
+            <form hx-post="{root_path}/admin/users/{user_email}/update" hx-target="#user-edit-modal-content" class="space-y-4">
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Email</label>
+                    <input type="email" name="email" value="{user_obj.email}" readonly
+                           class="mt-1 block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm bg-gray-50 dark:bg-gray-700 text-gray-900 dark:text-white">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Full Name</label>
+                    <input type="text" name="full_name" value="{user_obj.full_name or ""}" required
+                           class="mt-1 block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-700 text-gray-900 dark:text-white">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">
+                        <input type="checkbox" name="is_admin" {"checked" if user_obj.is_admin else ""}
+                               class="mr-2"> Administrator
+                    </label>
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">New Password (leave empty to keep current)</label>
+                    <input type="password" name="password" id="password-field"
+                           class="mt-1 block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-700 text-gray-900 dark:text-white"
+                           oninput="validatePasswordMatch()">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Confirm New Password</label>
+                    <input type="password" name="confirm_password" id="confirm-password-field"
+                           class="mt-1 block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-700 text-gray-900 dark:text-white"
+                           oninput="validatePasswordMatch()">
+                    <div id="password-match-message" class="mt-1 text-sm text-red-600 hidden">Passwords do not match</div>
+                </div>
+                <div class="flex justify-end space-x-3">
+                    <button type="button" onclick="hideUserEditModal()"
+                            class="px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-md hover:bg-gray-50 dark:hover:bg-gray-700">
+                        Cancel
+                    </button>
+                    <button type="submit"
+                            class="px-4 py-2 text-sm font-medium text-white bg-blue-600 border border-transparent rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500">
+                        Update User
+                    </button>
+                </div>
+            </form>
+        </div>
+        """
+        return HTMLResponse(content=edit_form)
+
+    except Exception as e:
+        LOGGER.error(f"Error getting user edit form for {user_email}: {e}")
+        return HTMLResponse(content=f'<div class="text-red-500">Error loading user: {str(e)}</div>', status_code=500)
+
+
+@admin_router.post("/users/{user_email}/update")
+@require_permission("admin.user_management")
+async def admin_update_user(
+    user_email: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    _user=Depends(get_current_user_with_permissions),
+) -> HTMLResponse:
+    """Update user via admin UI.
+
+    Args:
+        user_email: Email of user to update
+        request: FastAPI request object
+        db: Database session
+
+    Returns:
+        HTMLResponse: Success message or error response
+    """
+    if not settings.email_auth_enabled:
+        return HTMLResponse(content='<div class="text-red-500">Email authentication is disabled</div>', status_code=403)
+
+    try:
+        # First-Party
+        from mcpgateway.services.email_auth_service import EmailAuthService  # pylint: disable=import-outside-toplevel  # pylint: disable=import-outside-toplevel
+
+        auth_service = EmailAuthService(db)
+
+        # URL decode the email
+
+        decoded_email = urllib.parse.unquote(user_email)
+
+        form = await request.form()
+        full_name = form.get("full_name")
+        is_admin = form.get("is_admin") == "on"
+        password = form.get("password")
+        confirm_password = form.get("confirm_password")
+
+        # Validate password confirmation if password is being changed
+        if password and password != confirm_password:
+            return HTMLResponse(content='<div class="text-red-500">Passwords do not match</div>', status_code=400)
+
+        # Check if trying to remove admin privileges from last admin
+        user_obj = await auth_service.get_user_by_email(decoded_email)
+        if user_obj and user_obj.is_admin and not is_admin:
+            # This user is currently an admin and we're trying to remove admin privileges
+            if await auth_service.is_last_active_admin(decoded_email):
+                return HTMLResponse(content='<div class="text-red-500">Cannot remove administrator privileges from the last remaining admin user</div>', status_code=400)
+
+        # Update user
+        fn_val = form.get("full_name")
+        pw_val = form.get("password")
+        full_name = fn_val if isinstance(fn_val, str) else None
+        password = pw_val if isinstance(pw_val, str) else None
+        await auth_service.update_user(email=decoded_email, full_name=full_name, is_admin=is_admin, password=password if password else None)
+
+        # Return success message with auto-close and refresh
+        success_html = """
+        <div class="text-green-500 text-center p-4">
+            <p>User updated successfully</p>
+            <script>
+                setTimeout(() => {
+                    // Close the modal
+                    hideUserEditModal();
+                    // Refresh the users list
+                    htmx.trigger(document.getElementById('users-list'), 'load');
+                }, 1500);
+            </script>
+        </div>
+        """
+        return HTMLResponse(content=success_html)
+
+    except Exception as e:
+        LOGGER.error(f"Error updating user {user_email}: {e}")
+        return HTMLResponse(content=f'<div class="text-red-500">Error updating user: {str(e)}</div>', status_code=400)
+
+
+@admin_router.post("/users/{user_email}/activate")
+@require_permission("admin.user_management")
+async def admin_activate_user(
+    user_email: str,
+    _request: Request,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> HTMLResponse:
+    """Activate user via admin UI.
+
+    Args:
+        user_email: Email of user to activate
+        db: Database session
+        user: Current authenticated user context
+
+    Returns:
+        HTMLResponse: Success message or error response
+    """
+    if not settings.email_auth_enabled:
+        return HTMLResponse(content='<div class="text-red-500">Email authentication is disabled</div>', status_code=403)
+
+    try:
+        # Get root path for URL construction
+        root_path = _request.scope.get("root_path", "") if _request else ""
+
+        # First-Party
+        from mcpgateway.services.email_auth_service import EmailAuthService  # pylint: disable=import-outside-toplevel  # pylint: disable=import-outside-toplevel
+
+        auth_service = EmailAuthService(db)
+
+        # URL decode the email
+
+        decoded_email = urllib.parse.unquote(user_email)
+
+        # Get current user email from JWT (used for logging purposes)
+        get_user_email(user)
+
+        user_obj = await auth_service.activate_user(decoded_email)
+        user_html = f"""
+        <div class="user-card border border-gray-200 dark:border-gray-700 rounded-lg p-4 bg-white dark:bg-gray-800">
+            <div class="flex justify-between items-start">
+                <div class="flex-1">
+                    <div class="flex items-center gap-2 mb-2">
+                        <h3 class="text-lg font-semibold text-gray-900 dark:text-white">{user_obj.full_name}</h3>
+                        <span class="px-2 py-1 text-xs font-semibold text-green-600 bg-gray-100 dark:bg-gray-700 rounded-full">Active</span>
+                    </div>
+                    <p class="text-sm text-gray-600 dark:text-gray-400 mb-2">📧 {user_obj.email}</p>
+                    <p class="text-sm text-gray-600 dark:text-gray-400 mb-2">🔐 Provider: {user_obj.auth_provider}</p>
+                    <p class="text-sm text-gray-600 dark:text-gray-400">📅 Created: {user_obj.created_at.strftime("%Y-%m-%d %H:%M") if user_obj.created_at else "Unknown"}</p>
+                </div>
+                <div class="flex gap-2 ml-4">
+                    <button class="px-3 py-1 text-sm font-medium text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 border border-blue-300 dark:border-blue-600 hover:border-blue-500 dark:hover:border-blue-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
+                            hx-get="{root_path}/admin/users/{user_obj.email}/edit" hx-target="#user-edit-modal-content">
+                        Edit
+                    </button>
+                    <button class="px-3 py-1 text-sm font-medium text-orange-600 dark:text-orange-400 hover:text-orange-800 dark:hover:text-orange-300 border border-orange-300 dark:border-orange-600 hover:border-orange-500 dark:hover:border-orange-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-orange-500" hx-post="{root_path}/admin/users/{user_obj.email.replace("@", "%40")}/deactivate" hx-confirm="Deactivate this user?" hx-target="closest .user-card" hx-swap="outerHTML">Deactivate</button>
+                    <button class="px-3 py-1 text-sm font-medium text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300 border border-red-300 dark:border-red-600 hover:border-red-500 dark:hover:border-red-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500" hx-delete="{root_path}/admin/users/{user_obj.email.replace("@", "%40")}" hx-confirm="Are you sure you want to delete this user? This action cannot be undone." hx-target="closest .user-card" hx-swap="outerHTML">Delete</button>
+                </div>
+            </div>
+        </div>
+        """
+        return HTMLResponse(content=user_html)
+
+    except Exception as e:
+        LOGGER.error(f"Error activating user {user_email}: {e}")
+        return HTMLResponse(content=f'<div class="text-red-500">Error activating user: {str(e)}</div>', status_code=400)
+
+
+@admin_router.post("/users/{user_email}/deactivate")
+@require_permission("admin.user_management")
+async def admin_deactivate_user(
+    user_email: str,
+    _request: Request,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> HTMLResponse:
+    """Deactivate user via admin UI.
+
+    Args:
+        user_email: Email of user to deactivate
+        db: Database session
+        user: Current authenticated user context
+
+    Returns:
+        HTMLResponse: Success message or error response
+    """
+    if not settings.email_auth_enabled:
+        return HTMLResponse(content='<div class="text-red-500">Email authentication is disabled</div>', status_code=403)
+
+    try:
+        # Get root path for URL construction
+        root_path = _request.scope.get("root_path", "") if _request else ""
+
+        # First-Party
+        from mcpgateway.services.email_auth_service import EmailAuthService  # pylint: disable=import-outside-toplevel  # pylint: disable=import-outside-toplevel
+
+        auth_service = EmailAuthService(db)
+
+        # URL decode the email
+
+        decoded_email = urllib.parse.unquote(user_email)
+
+        # Get current user email from JWT
+        current_user_email = get_user_email(user)
+
+        # Prevent self-deactivation
+        if decoded_email == current_user_email:
+            return HTMLResponse(content='<div class="text-red-500">Cannot deactivate your own account</div>', status_code=400)
+
+        # Prevent deactivating the last active admin user
+        if await auth_service.is_last_active_admin(decoded_email):
+            return HTMLResponse(content='<div class="text-red-500">Cannot deactivate the last remaining admin user</div>', status_code=400)
+
+        user_obj = await auth_service.deactivate_user(decoded_email)
+        user_html = f"""
+        <div class="user-card border border-gray-200 dark:border-gray-700 rounded-lg p-4 bg-white dark:bg-gray-800">
+            <div class="flex justify-between items-start">
+                <div class="flex-1">
+                    <div class="flex items-center gap-2 mb-2">
+                        <h3 class="text-lg font-semibold text-gray-900 dark:text-white">{user_obj.full_name}</h3>
+                        <span class="px-2 py-1 text-xs font-semibold text-red-600 bg-gray-100 dark:bg-gray-700 rounded-full">Inactive</span>
+                    </div>
+                    <p class="text-sm text-gray-600 dark:text-gray-400 mb-2">📧 {user_obj.email}</p>
+                    <p class="text-sm text-gray-600 dark:text-gray-400 mb-2">🔐 Provider: {user_obj.auth_provider}</p>
+                    <p class="text-sm text-gray-600 dark:text-gray-400">📅 Created: {user_obj.created_at.strftime("%Y-%m-%d %H:%M") if user_obj.created_at else "Unknown"}</p>
+                </div>
+                <div class="flex gap-2 ml-4">
+                    <button class="px-3 py-1 text-sm font-medium text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 border border-blue-300 dark:border-blue-600 hover:border-blue-500 dark:hover:border-blue-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
+                            hx-get="{root_path}/admin/users/{user_obj.email}/edit" hx-target="#user-edit-modal-content">
+                        Edit
+                    </button>
+                    <button class="px-3 py-1 text-sm font-medium text-green-600 dark:text-green-400 hover:text-green-800 dark:hover:text-green-300 border border-green-300 dark:border-green-600 hover:border-green-500 dark:hover:border-green-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-green-500" hx-post="{root_path}/admin/users/{user_obj.email.replace("@", "%40")}/activate" hx-confirm="Activate this user?" hx-target="closest .user-card" hx-swap="outerHTML">Activate</button>
+                    <button class="px-3 py-1 text-sm font-medium text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300 border border-red-300 dark:border-red-600 hover:border-red-500 dark:hover:border-red-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500" hx-delete="{root_path}/admin/users/{user_obj.email.replace("@", "%40")}" hx-confirm="Are you sure you want to delete this user? This action cannot be undone." hx-target="closest .user-card" hx-swap="outerHTML">Delete</button>
+                </div>
+            </div>
+        </div>
+        """
+        return HTMLResponse(content=user_html)
+
+    except Exception as e:
+        LOGGER.error(f"Error deactivating user {user_email}: {e}")
+        return HTMLResponse(content=f'<div class="text-red-500">Error deactivating user: {str(e)}</div>', status_code=400)
+
+
+@admin_router.delete("/users/{user_email}")
+@require_permission("admin.user_management")
+async def admin_delete_user(
+    user_email: str,
+    _request: Request,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> HTMLResponse:
+    """Delete user via admin UI.
+
+    Args:
+        user_email: Email address of user to delete
+        _request: FastAPI request object (unused)
+        db: Database session
+        user: Current authenticated user context
+
+    Returns:
+        HTMLResponse: Success/error message
     """
     if logger: logger.debug(f"User {user} accessed the admin UI")
     tools = [

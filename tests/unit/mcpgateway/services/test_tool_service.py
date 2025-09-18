@@ -8,6 +8,7 @@ Tests for tool service implementation.
 """
 
 # Standard
+import base64
 import asyncio
 from contextlib import asynccontextmanager
 import logging
@@ -152,11 +153,19 @@ class TestToolService:
     async def test_convert_tool_to_read_basic_auth(self, tool_service, mock_tool):
         """Check auth for basic auth"""
 
+            # Build Authorization header with base64 encoded user:password
+        creds = base64.b64encode(b"test_user:test_password").decode()
+        auth_dict = {"Authorization": f"Basic {creds}"}
+
+        mock_tool.auth_type = "basic"
+        mock_tool.auth_value = encode_auth(auth_dict)
+
         mock_tool.auth_type = "basic"
         # Create auth_value with the following values
         # user = "test_user"
         # password = "test_password"
-        mock_tool.auth_value = "FpZyxAu5PVpT0FN-gJ0JUmdovCMS0emkwW1Vb8HvkhjiBZhj1gDgDRF1wcWNrjTJSLtkz1rLzKibXrhk4GbxXnV6LV4lSw_JDYZ2sPNRy68j_UKOJnf_"
+        #mock_tool.auth_value = "FpZyxAu5PVpT0FN-gJ0JUmdovCMS0emkwW1Vb8HvkhjiBZhj1gDgDRF1wcWNrjTJSLtkz1rLzKibXrhk4GbxXnV6LV4lSw_JDYZ2sPNRy68j_UKOJnf_"
+        #mock_tool.auth_value = encode_auth({"user": "test_user", "password": "test_password"})
         tool_read = tool_service._convert_tool_to_read(mock_tool)
 
         assert tool_read.auth.auth_type == "basic"
@@ -170,7 +179,7 @@ class TestToolService:
         mock_tool.auth_type = "bearer"
         # Create auth_value with the following values
         # bearer token ABC123
-        mock_tool.auth_value = "--vbQRQCYlgdUh5FYvtRUH874sc949BP5rRVRRyh3KzahgBIQpjJOKz0BJ2xATUAhyxHUwkMG6ZM2OPLHc4"
+        mock_tool.auth_value = encode_auth({"Authorization": "Bearer ABC123"})
         tool_read = tool_service._convert_tool_to_read(mock_tool)
 
         assert tool_read.auth.auth_type == "bearer"
@@ -183,7 +192,8 @@ class TestToolService:
         mock_tool.auth_type = "authheaders"
         # Create auth_value with the following values
         # {"test-api-key": "test-api-value"}
-        mock_tool.auth_value = "8pvPTCegaDhrx0bmBf488YvGg9oSo4cJJX68WCTvxjMY-C2yko_QSPGVggjjNt59TPvlGLsotTZvAiewPRQ"
+        #mock_tool.auth_value = "8pvPTCegaDhrx0bmBf488YvGg9oSo4cJJX68WCTvxjMY-C2yko_QSPGVggjjNt59TPvlGLsotTZvAiewPRQ"
+        mock_tool.auth_value = encode_auth({"test-api-key": "test-api-value"})
         tool_read = tool_service._convert_tool_to_read(mock_tool)
 
         assert tool_read.auth.auth_type == "authheaders"
@@ -1116,7 +1126,10 @@ class TestToolService:
         # Create auth_value with the following values
         # user = "test_user"
         # password = "test_password"
-        basic_auth_value = "FpZyxAu5PVpT0FN-gJ0JUmdovCMS0emkwW1Vb8HvkhjiBZhj1gDgDRF1wcWNrjTJSLtkz1rLzKibXrhk4GbxXnV6LV4lSw_JDYZ2sPNRy68j_UKOJnf_"
+        creds = base64.b64encode(b"test_user:test_password").decode()
+        auth_dict = {"Authorization": f"Basic {creds}"}
+        basic_auth_value = encode_auth(auth_dict)
+        #basic_auth_value = "FpZyxAu5PVpT0FN-gJ0JUmdovCMS0emkwW1Vb8HvkhjiBZhj1gDgDRF1wcWNrjTJSLtkz1rLzKibXrhk4GbxXnV6LV4lSw_JDYZ2sPNRy68j_UKOJnf_"
 
         # Create update request
         tool_update = ToolUpdate(auth=AuthenticationValues(auth_type="basic", auth_value=basic_auth_value))
@@ -1138,8 +1151,7 @@ class TestToolService:
         # Bearer auth_value
         # Create auth_value with the following values
         # token = "test_token"
-        basic_auth_value = "OrZImykkCmMkfNETfO-tk_ZNv9QSUKBZUEKC81-OzdnZqnAslksS7rhvpty41-kHLc42TfKF9sIYr1Q2W4GhXAz_"
-
+        basic_auth_value = encode_auth({"Authorization": "Bearer test_token"})
         # Create update request
         tool_update = ToolUpdate(auth=AuthenticationValues(auth_type="bearer", auth_value=basic_auth_value))
 
@@ -1585,7 +1597,8 @@ class TestToolService:
         # Create auth_value with the following values
         # user = "test_user"
         # password = "test_password"
-        basic_auth_value = "FpZyxAu5PVpT0FN-gJ0JUmdovCMS0emkwW1Vb8HvkhjiBZhj1gDgDRF1wcWNrjTJSLtkz1rLzKibXrhk4GbxXnV6LV4lSw_JDYZ2sPNRy68j_UKOJnf_"
+        basic_auth_value = encode_auth({
+        "Authorization": "Basic " + base64.b64encode(b"test_user:test_password").decode()})
 
         # Configure tool as REST
         mock_tool.integration_type = "MCP"
@@ -2406,6 +2419,59 @@ class TestToolService:
             patch("mcpgateway.config.extract_using_jq", return_value={"result": "original response"}),
         ):
             result = await tool_service.invoke_tool(test_db, "test_tool", {"param": "value"}, request_headers=None)
+
+        # Verify result still succeeded despite plugin error
+        assert result.content[0].text == '{\n  "result": "original response"\n}'
+
+        await tool_service._plugin_manager.shutdown()
+
+    async def test_invoke_tool_with_plugin_metadata_sse(self, tool_service, mock_tool, mock_gateway, test_db):
+        """Test invoking tool with plugin post-invoke hook error when fail_on_plugin_error is True."""
+        # Configure tool as REST
+        #mock_tool.integration_type = "REST"
+        #mock_tool.request_type = "POST"
+        #mock_tool.auth_value = None
+        mock_tool.integration_type = "MCP"
+        mock_tool.request_type = "sse"
+        mock_gateway.auth_value = None
+
+        # Mock DB queries
+        mock_scalar1 = Mock()
+        mock_scalar1.scalar_one_or_none.return_value = mock_tool
+        mock_scalar2 = Mock()
+        mock_scalar2.scalar_one_or_none.return_value = mock_gateway
+        mock_scalar3 = Mock()
+        mock_scalar3.scalar_one_or_none.return_value = mock_gateway
+
+        test_db.execute = Mock(side_effect=[mock_scalar1, mock_scalar2, mock_scalar3])
+
+        expected_result = ToolResult(content=[TextContent(type="text", text="MCP OAuth response")])
+        session_mock = AsyncMock()
+        session_mock.initialize = AsyncMock()
+        session_mock.call_tool = AsyncMock(return_value=expected_result)
+
+        client_session_cm = AsyncMock()
+        client_session_cm.__aenter__.return_value = session_mock
+        client_session_cm.__aexit__.return_value = AsyncMock()
+
+        sse_ctx = AsyncMock()
+        sse_ctx.__aenter__.return_value = ("read", "write")
+
+
+        # Mock HTTP client response
+
+        # Mock plugin manager and post-invoke hook with error
+        tool_service._plugin_manager = PluginManager("./tests/unit/mcpgateway/plugins/fixtures/configs/tool_headers_metadata_plugin.yaml")
+        await tool_service._plugin_manager.initialize()
+        # Mock metrics recording
+        tool_service._record_tool_metric = AsyncMock()
+
+        with (
+            patch("mcpgateway.services.tool_service.sse_client", return_value=sse_ctx),
+            patch("mcpgateway.services.tool_service.ClientSession", return_value=client_session_cm),
+            patch("mcpgateway.services.tool_service.extract_using_jq", side_effect=lambda data, _filt: data),
+        ):
+            await tool_service.invoke_tool(test_db, "test_tool", {"param": "value"}, request_headers=None)
 
         # Verify result still succeeded despite plugin error
         assert result.content[0].text == '{\n  "result": "original response"\n}'

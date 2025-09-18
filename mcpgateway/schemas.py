@@ -511,8 +511,8 @@ class ToolCreate(BaseModel):
             >>> ToolCreate.validate_description(None) # Test None case
             >>> long_desc = 'x' * SecurityValidator.MAX_DESCRIPTION_LENGTH
             >>> truncated = ToolCreate.validate_description(long_desc)
-            >>> len(truncated)
-            8192
+            >>> len(truncated) - SecurityValidator.MAX_DESCRIPTION_LENGTH
+            0
             >>> truncated == long_desc[:SecurityValidator.MAX_DESCRIPTION_LENGTH]
             True
         """
@@ -839,8 +839,8 @@ class ToolUpdate(BaseModelWithConfigDict):
             >>> ToolUpdate.validate_description(None)  # Test None case
             >>> long_desc = 'x' * SecurityValidator.MAX_DESCRIPTION_LENGTH
             >>> truncated = ToolUpdate.validate_description(long_desc)
-            >>> len(truncated)
-            8192
+            >>> len(truncated) - SecurityValidator.MAX_DESCRIPTION_LENGTH
+            0
             >>> truncated == long_desc[:SecurityValidator.MAX_DESCRIPTION_LENGTH]
             True
         """
@@ -1307,8 +1307,8 @@ class ResourceCreate(BaseModel):
             >>> ResourceCreate.validate_description(None) # Test None case
             >>> long_desc = 'x' * SecurityValidator.MAX_DESCRIPTION_LENGTH
             >>> truncated = ResourceCreate.validate_description(long_desc)
-            >>> len(truncated)
-            8192
+            >>> len(truncated) - SecurityValidator.MAX_DESCRIPTION_LENGTH
+            0
             >>> truncated == long_desc[:SecurityValidator.MAX_DESCRIPTION_LENGTH]
             True
         """
@@ -1434,8 +1434,8 @@ class ResourceUpdate(BaseModelWithConfigDict):
             >>> ResourceUpdate.validate_description(None) # Test None case
             >>> long_desc = 'x' * SecurityValidator.MAX_DESCRIPTION_LENGTH
             >>> truncated = ResourceUpdate.validate_description(long_desc)
-            >>> len(truncated)
-            8192
+            >>> len(truncated) - SecurityValidator.MAX_DESCRIPTION_LENGTH
+            0
             >>> truncated == long_desc[:SecurityValidator.MAX_DESCRIPTION_LENGTH]
             True
         """
@@ -1822,8 +1822,8 @@ class PromptCreate(BaseModel):
             >>> PromptCreate.validate_description(None) # Test None case
             >>> long_desc = 'x' * SecurityValidator.MAX_DESCRIPTION_LENGTH
             >>> truncated = PromptCreate.validate_description(long_desc)
-            >>> len(truncated)
-            8192
+            >>> len(truncated) - SecurityValidator.MAX_DESCRIPTION_LENGTH
+            0
             >>> truncated == long_desc[:SecurityValidator.MAX_DESCRIPTION_LENGTH]
             True
         """
@@ -1957,8 +1957,8 @@ class PromptUpdate(BaseModelWithConfigDict):
             >>> PromptUpdate.validate_description(None) # Test None case
             >>> long_desc = 'x' * SecurityValidator.MAX_DESCRIPTION_LENGTH
             >>> truncated = PromptUpdate.validate_description(long_desc)
-            >>> len(truncated)
-            8192
+            >>> len(truncated) - SecurityValidator.MAX_DESCRIPTION_LENGTH
+            0
             >>> truncated == long_desc[:SecurityValidator.MAX_DESCRIPTION_LENGTH]
             True
         """
@@ -2205,8 +2205,8 @@ class GatewayCreate(BaseModel):
             >>> GatewayCreate.validate_description(None) # Test None case
             >>> long_desc = 'x' * SecurityValidator.MAX_DESCRIPTION_LENGTH
             >>> truncated = ToolCreate.validate_description(long_desc)
-            >>> len(truncated)
-            8192
+            >>> len(truncated) - SecurityValidator.MAX_DESCRIPTION_LENGTH
+            0
             >>> truncated == long_desc[:SecurityValidator.MAX_DESCRIPTION_LENGTH]
             True
         """
@@ -2464,8 +2464,8 @@ class GatewayUpdate(BaseModelWithConfigDict):
             >>> GatewayUpdate.validate_description(None) # Test None case
             >>> long_desc = 'x' * SecurityValidator.MAX_DESCRIPTION_LENGTH
             >>> truncated = ToolCreate.validate_description(long_desc)
-            >>> len(truncated)
-            8192
+            >>> len(truncated) - SecurityValidator.MAX_DESCRIPTION_LENGTH
+            0
             >>> truncated == long_desc[:SecurityValidator.MAX_DESCRIPTION_LENGTH]
             True
         """
@@ -3150,8 +3150,8 @@ class ServerCreate(BaseModel):
             >>> ServerCreate.validate_description(None) # Test None case
             >>> long_desc = 'x' * SecurityValidator.MAX_DESCRIPTION_LENGTH
             >>> truncated = ServerCreate.validate_description(long_desc)
-            >>> len(truncated)
-            8192
+            >>> len(truncated) - SecurityValidator.MAX_DESCRIPTION_LENGTH
+            0
             >>> truncated == long_desc[:SecurityValidator.MAX_DESCRIPTION_LENGTH]
             True
         """
@@ -3325,8 +3325,8 @@ class ServerUpdate(BaseModelWithConfigDict):
             >>> ServerUpdate.validate_description(None) # Test None case
             >>> long_desc = 'x' * SecurityValidator.MAX_DESCRIPTION_LENGTH
             >>> truncated = ServerUpdate.validate_description(long_desc)
-            >>> len(truncated)
-            8192
+            >>> len(truncated) - SecurityValidator.MAX_DESCRIPTION_LENGTH
+            0
             >>> truncated == long_desc[:SecurityValidator.MAX_DESCRIPTION_LENGTH]
             True
         """
@@ -3632,8 +3632,8 @@ class A2AAgentCreate(BaseModel):
             >>> A2AAgentCreate.validate_description(None) # Test None case
             >>> long_desc = 'x' * SecurityValidator.MAX_DESCRIPTION_LENGTH
             >>> truncated = A2AAgentCreate.validate_description(long_desc)
-            >>> len(truncated)
-            8192
+            >>> len(truncated) - SecurityValidator.MAX_DESCRIPTION_LENGTH
+            0
             >>> truncated == long_desc[:SecurityValidator.MAX_DESCRIPTION_LENGTH]
             True
         """
@@ -3778,8 +3778,8 @@ class A2AAgentUpdate(BaseModelWithConfigDict):
             >>> A2AAgentUpdate.validate_description(None) # Test None case
             >>> long_desc = 'x' * SecurityValidator.MAX_DESCRIPTION_LENGTH
             >>> truncated = A2AAgentUpdate.validate_description(long_desc)
-            >>> len(truncated)
-            8192
+            >>> len(truncated) - SecurityValidator.MAX_DESCRIPTION_LENGTH
+            0
             >>> truncated == long_desc[:SecurityValidator.MAX_DESCRIPTION_LENGTH]
             True
         """
